@@ -111,6 +111,7 @@ fn percent_decode(input: &str, plus_is_space: bool) -> Result<SensitiveVec, Stri
             b'%' => {
                 let value = bytes
                     .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                     .ok_or("otpauth 링크의 % 인코딩이 올바르지 않습니다.")?;
@@ -195,6 +196,9 @@ pub fn parse_otpauth(uri: &str) -> Result<OtpAuth, String> {
                     .parse()
                     .map_err(|_| format!("주기 값이 올바르지 않습니다: {value}"))?
             }
+            // A non-standard encoder (e.g. Steam Guard) would never match our
+            // numeric codes; refuse instead of silently producing wrong codes.
+            "encoder" => return Err(format!("지원하지 않는 코드 형식입니다: {value}")),
             _ => {}
         }
     }
@@ -520,6 +524,8 @@ mod tests {
             "otpauth://totp/x?secret=MZXW6&algorithm=MD5",
             "otpauth://totp/x?secret=MZXW6&digits=six",
             "otpauth://totp/x?secret=MZ0W6",
+            "otpauth://totp/x?secret=MZ%+9XW6",
+            "otpauth://totp/x?secret=MZXW6&encoder=steam",
         ] {
             assert!(parse_otpauth(bad).is_err(), "accepted {bad}");
         }

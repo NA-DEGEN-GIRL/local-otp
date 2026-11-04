@@ -128,6 +128,14 @@ unsafe extern "system" {
         flags: u32,
     ) -> NtStatus;
     fn BCryptCloseAlgorithmProvider(alg: Handle, flags: u32) -> NtStatus;
+    fn BCryptGetProperty(
+        obj: Handle,
+        name: *const u16,
+        out: *mut u8,
+        len: u32,
+        result: *mut u32,
+        flags: u32,
+    ) -> NtStatus;
     fn BCryptSetProperty(
         obj: Handle,
         name: *const u16,
@@ -247,6 +255,12 @@ fn wipe(bytes: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 impl<const N: usize> Drop for Secret<{ N }> {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+struct WipedVec(Vec<u8>);
+impl Drop for WipedVec {
     fn drop(&mut self) {
         wipe(&mut self.0);
     }
@@ -581,9 +595,40 @@ fn aes(
         },
         "AES GCM mode",
     )?;
+    // Supply the key object memory ourselves so the AES key schedule is wiped
+    // after CNG releases it. Declared before `h`, so it is dropped after it.
+    let mut object_len = 0u32;
+    let mut got = 0u32;
+    nt(
+        unsafe {
+            BCryptGetProperty(
+                a.0,
+                wide("ObjectLength").as_ptr(),
+                (&mut object_len as *mut u32).cast(),
+                4,
+                &mut got,
+                0,
+            )
+        },
+        "AES object length",
+    )?;
+    if got != 4 || object_len == 0 || object_len > 1_048_576 {
+        return Err("Invalid AES object length".into());
+    }
+    let mut object = WipedVec(vec![0u8; object_len as usize]);
     let mut h = ptr::null_mut();
     nt(
-        unsafe { BCryptGenerateSymmetricKey(a.0, &mut h, ptr::null_mut(), 0, key.as_ptr(), 32, 0) },
+        unsafe {
+            BCryptGenerateSymmetricKey(
+                a.0,
+                &mut h,
+                object.0.as_mut_ptr(),
+                object_len,
+                key.as_ptr(),
+                32,
+                0,
+            )
+        },
         "AES key",
     )?;
     let h = Sym(h);
@@ -669,8 +714,12 @@ fn check_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Largest vault file the app reads back. Sealing is limited so that every
+/// vault written can also be opened again.
+pub const MAX_FILE: usize = 16 * 1024 * 1024;
+
 fn check_plaintext(plaintext: &[u8]) -> Result<(), String> {
-    if plaintext.len() > MAX_CIPHER {
+    if plaintext.len() > MAX_CIPHER.min(MAX_FILE - HEADER - 256 - TAG_LEN) {
         return Err("보관함이 너무 큽니다.".into());
     }
     Ok(())
@@ -748,6 +797,15 @@ fn seal(tpm: &N, key: &VaultKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let ciphertext = aes(&derived.0, &nonce, &out, plaintext, &mut tag, true)?;
     out.extend_from_slice(&ciphertext);
     out.extend_from_slice(&tag);
+    // The new blob replaces the only copy, so prove it opens (with the TPM)
+    // and round-trips exactly before handing it to the caller for writing.
+    let mut check = unseal(tpm, key, &out)
+        .map_err(|e| format!("새로 암호화한 보관함 검증 실패, 저장하지 않았습니다: {e}"))?;
+    let same = check == plaintext;
+    wipe(&mut check);
+    if !same {
+        return Err("새로 암호화한 보관함 검증 실패, 저장하지 않았습니다.".into());
+    }
     Ok(out)
 }
 

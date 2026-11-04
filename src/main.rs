@@ -114,6 +114,7 @@ unsafe extern "system" {
     fn ShowWindow(h: H, n: i32) -> i32;
     fn UpdateWindow(h: H) -> i32;
     fn GetMessageW(m: *mut Msg, h: H, a: u32, b: u32) -> i32;
+    fn PeekMessageW(m: *mut Msg, h: H, a: u32, b: u32, remove: u32) -> i32;
     fn TranslateMessage(m: *const Msg) -> i32;
     fn DispatchMessageW(m: *const Msg) -> isize;
     fn IsDialogMessageW(h: H, m: *mut Msg) -> i32;
@@ -333,6 +334,10 @@ const CLIPBOARD_CLEAR: Duration = Duration::from_secs(30);
 const STATUS_TTL: Duration = Duration::from_secs(6);
 const MIN_PASSWORD_CHARS: usize = 12;
 const ROW_HEIGHT: i32 = 62;
+/// List item heights are limited to 255 px (reached above ~400% scaling).
+fn row_height() -> i32 {
+    sc(ROW_HEIGHT).min(255)
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -530,7 +535,7 @@ fn deserialize(data: &[u8]) -> Result<Vec<Entry>, String> {
     Ok(result)
 }
 fn read_vault_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    const LIMIT: u64 = 16 * 1024 * 1024;
+    const LIMIT: u64 = vault::MAX_FILE as u64;
     let file = fs::File::open(path).map_err(|e| format!("보관함을 읽을 수 없습니다: {e}"))?;
     let mut data = Vec::new();
     file.take(LIMIT + 1)
@@ -784,7 +789,12 @@ unsafe fn get_text(h: H) -> SecretText {
     let n = GetWindowTextLengthW(h).clamp(0, 8192) as usize;
     let mut b = vec![0u16; n + 1];
     let got = (GetWindowTextW(h, b.as_mut_ptr(), (n + 1) as i32).max(0) as usize).min(n);
-    let s = String::from_utf16_lossy(&b[..got]);
+    // One UTF-16 unit is at most 3 UTF-8 bytes: reserve once so a reallocation
+    // never frees an unwiped partial copy of a password or secret.
+    let mut s = String::with_capacity(got * 3);
+    for c in char::decode_utf16(b[..got].iter().copied()) {
+        s.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
     for v in &mut b {
         std::ptr::write_volatile(v, 0)
     }
@@ -820,6 +830,12 @@ unsafe fn protect_window(h: H) {
     if SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) == 0 {
         SetWindowDisplayAffinity(h, WDA_MONITOR);
     }
+}
+/// Drop keys pressed during a slow TPM operation, so an extra Enter typed while
+/// unlocking does not copy a code (or retry) once the operation finishes.
+unsafe fn discard_typeahead() {
+    let mut msg: Msg = zeroed();
+    while PeekMessageW(&mut msg, null_mut(), WM_KEYDOWN, 0x0109, 1) != 0 {}
 }
 unsafe fn wait_cursor() {
     SetCursor(LoadCursorW(null_mut(), 32514usize as *const u16));
@@ -996,6 +1012,11 @@ unsafe fn sync_list(a: &mut App, keep: Option<usize>) {
         },
     );
     update_buttons(a);
+    // Deleting the last (visible) account can disable or hide the focused control.
+    let focus = GetFocus();
+    if IsChild(a.hwnd, focus) != 0 && (IsWindowVisible(focus) == 0 || IsWindowEnabled(focus) == 0) {
+        SetFocus(default_focus(a));
+    }
 }
 /// Recompute display rows; codes are recomputed only when their time step changes.
 unsafe fn update_rows(a: &App, now: u64) {
@@ -1077,17 +1098,21 @@ unsafe fn set_clipboard_data(format: u32, bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+/// Other programs (clipboard managers, RDP) briefly hold the clipboard open.
+unsafe fn open_clipboard(owner: H) -> bool {
+    for attempt in 0..10 {
+        if OpenClipboard(owner) != 0 {
+            return true;
+        }
+        if attempt < 9 {
+            Sleep(20);
+        }
+    }
+    false
+}
 /// Copy text and return the clipboard sequence number identifying our copy.
 unsafe fn copy_to_clipboard(owner: H, text: &str) -> Result<u32, String> {
-    let mut opened = false;
-    for _ in 0..10 {
-        if OpenClipboard(owner) != 0 {
-            opened = true;
-            break;
-        }
-        Sleep(20);
-    }
-    if !opened {
+    if !open_clipboard(owner) {
         return Err("클립보드를 열 수 없습니다. 다른 프로그램이 사용 중일 수 있습니다.".into());
     }
     let result = (|| {
@@ -1112,20 +1137,31 @@ unsafe fn copy_to_clipboard(owner: H, text: &str) -> Result<u32, String> {
         }
         Ok(())
     })();
+    // The sequence number changes when the clipboard is closed, so it must be
+    // read afterwards (reading it while open records a stale value).
     CloseClipboard();
     result?;
     Ok(GetClipboardSequenceNumber())
 }
 /// Clear the clipboard only if it still holds the code this app copied.
+/// If the clipboard is busy the record is kept and the next tick retries.
 unsafe fn clear_our_clipboard(a: &mut App) -> bool {
-    match a.clipboard.take() {
-        Some((seq, _)) if GetClipboardSequenceNumber() == seq && OpenClipboard(a.hwnd) != 0 => {
-            EmptyClipboard();
-            CloseClipboard();
-            true
-        }
-        _ => false,
+    let Some((seq, _)) = a.clipboard else {
+        return false;
+    };
+    if GetClipboardSequenceNumber() != seq {
+        a.clipboard = None; // Something else was copied since; leave it alone.
+        return false;
     }
+    if !open_clipboard(a.hwnd) {
+        return false;
+    }
+    if GetClipboardSequenceNumber() == seq {
+        EmptyClipboard();
+    }
+    CloseClipboard();
+    a.clipboard = None;
+    true
 }
 unsafe fn copy_selected(a: &mut App) -> Result<(), String> {
     let Some(s) = &a.session else { return Ok(()) };
@@ -1188,6 +1224,13 @@ unsafe fn lock_now(reason: &'static str) -> bool {
     if done {
         let dialog = ui(|u| u.dialog.get());
         if !dialog.is_null() {
+            // Clear now: a nested message box can delay the dialog's destruction.
+            for id in [ID_SECRET, ID_PASSWORD] {
+                let edit = GetDlgItem(dialog, id);
+                if !edit.is_null() {
+                    clear_edit(edit);
+                }
+            }
             EndDialog(dialog, 0);
         }
     }
@@ -1204,6 +1247,8 @@ fn touch() {
 unsafe fn tick() {
     let idle = with_app(|a| {
         if a.session.is_none() {
+            // Retry a clear that failed at lock time because the clipboard was busy.
+            clear_our_clipboard(a);
             update_caps(a);
             return false;
         }
@@ -1234,10 +1279,16 @@ unsafe fn unlock(hwnd: H) {
         Open(PathBuf, SecretText),
         Create(PathBuf, SecretText),
     }
-    let plan = with_app(|a| -> Result<Plan, String> {
+    let plan = with_app(|a| -> Result<(Plan, u64), String> {
         if a.session.is_some() {
             return Err(String::new());
         }
+        if a.path.exists() == a.new_vault {
+            // The vault file appeared or vanished since this page was shown.
+            show_page(a);
+            return Err(String::new());
+        }
+        let generation = a.generation;
         let pass = get_text(a.c.pass);
         if pass.is_empty() {
             SetFocus(a.c.pass);
@@ -1246,7 +1297,7 @@ unsafe fn unlock(hwnd: H) {
         if a.path.exists() {
             clear_edit(a.c.pass);
             clear_edit(a.c.confirm);
-            return Ok(Plan::Open(a.path.clone(), pass));
+            return Ok((Plan::Open(a.path.clone(), pass), generation));
         }
         if pass.chars().count() < MIN_PASSWORD_CHARS {
             SetFocus(a.c.pass);
@@ -1259,9 +1310,9 @@ unsafe fn unlock(hwnd: H) {
             SetFocus(a.c.confirm);
             return Err("비밀번호 확인이 일치하지 않습니다.".into());
         }
-        Ok(Plan::Create(a.path.clone(), pass))
+        Ok((Plan::Create(a.path.clone(), pass), generation))
     });
-    let plan = match plan {
+    let (plan, generation) = match plan {
         Some(Ok(plan)) => plan,
         Some(Err(e)) if !e.is_empty() => return notice(hwnd, &e),
         _ => return,
@@ -1273,13 +1324,18 @@ unsafe fn unlock(hwnd: H) {
             wide("보관함 만들기").as_ptr(),
             MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
         );
-        if answer != IDOK as i32 {
+        // Never create after a lock (Win+L, suspend) while the warning was open.
+        let still_valid = with_app(|a| {
+            let valid = a.generation == generation && !a.path.exists();
+            if valid && answer == IDOK as i32 {
+                clear_edit(a.c.pass);
+                clear_edit(a.c.confirm);
+            }
+            valid
+        });
+        if answer != IDOK as i32 || still_valid != Some(true) {
             return;
         }
-        with_app(|a| {
-            clear_edit(a.c.pass);
-            clear_edit(a.c.confirm);
-        });
     }
     with_app(|a| {
         set(a.c.subtitle, "확인 중…");
@@ -1307,6 +1363,7 @@ unsafe fn unlock(hwnd: H) {
     };
     let created = matches!(plan, Plan::Create(..));
     drop(plan);
+    discard_typeahead();
     match result {
         Ok(session) => {
             with_app(move |a| {
@@ -1566,6 +1623,7 @@ struct AddState {
     result: RefCell<Option<Entry>>,
     font: Cell<H>,
     error: Cell<bool>,
+    message: RefCell<Option<String>>,
 }
 struct Parsed {
     secret: Secret,
@@ -1683,6 +1741,11 @@ unsafe fn update_preview(dlg: H, apply_link: bool) {
             }
         }
     };
+    // A validation message from the last 추가 attempt stays until an input changes.
+    let (hint, error) = match st.message.borrow().clone() {
+        Some(message) if !error => (message, true),
+        _ => (hint, error),
+    };
     st.error.set(error);
     set_if_changed(GetDlgItem(dlg, ID_HINT), &hint);
     InvalidateRect(GetDlgItem(dlg, ID_HINT), null(), 1);
@@ -1693,9 +1756,8 @@ unsafe fn add_confirm(dlg: H) {
         return;
     };
     let fail = |message: &str, focus: i32| {
-        st.error.set(true);
-        set(GetDlgItem(dlg, ID_HINT), message);
-        set(GetDlgItem(dlg, ID_CODE), "");
+        *st.message.borrow_mut() = Some(message.to_string());
+        update_preview(dlg, false);
         SetFocus(GetDlgItem(dlg, focus));
     };
     let name = get_text(GetDlgItem(dlg, ID_NAME)).trim().to_string();
@@ -1772,8 +1834,19 @@ unsafe extern "system" fn add_proc(dlg: H, msg: u32, w: usize, l: isize) -> isiz
         WM_COMMAND => {
             touch();
             let (id, code) = ((w & 0xffff) as i32, (w >> 16) & 0xffff);
+            let edited = matches!((id, code), (ID_NAME | ID_SECRET, EN_CHANGE))
+                || matches!(
+                    (id, code),
+                    (ID_ALGORITHM | ID_DIGITS | ID_PERIOD, CBN_SELCHANGE)
+                );
+            if edited {
+                if let Some(st) = dialog_state::<AddState>(dlg) {
+                    st.message.borrow_mut().take();
+                }
+            }
             match id {
                 ID_SECRET if code == EN_CHANGE => update_preview(dlg, true),
+                ID_NAME if code == EN_CHANGE => update_preview(dlg, false),
                 ID_ALGORITHM | ID_DIGITS | ID_PERIOD if code == CBN_SELCHANGE => {
                     update_preview(dlg, false)
                 }
@@ -1863,6 +1936,7 @@ unsafe fn run_add_dialog(owner: H, names: Vec<String>) -> Option<Entry> {
         result: RefCell::new(None),
         font: Cell::new(null_mut()),
         error: Cell::new(false),
+        message: RefCell::new(None),
     };
     t.run(owner, add_proc, &state as *const AddState as isize);
     state.result.into_inner()
@@ -1949,9 +2023,15 @@ unsafe fn run_confirm_dialog(owner: H, name: &str) -> Option<SecretText> {
         IDOK as i32,
     );
     t.item(BUTTON, "취소", 0, 184, 84, 50, 15, IDCANCEL as i32);
+    // Shorten long names so the warning itself is never clipped.
+    let shown: String = if name.chars().count() > 40 {
+        name.chars().take(39).chain(Some('…')).collect()
+    } else {
+        name.to_string()
+    };
     let state = ConfirmState {
         message: format!(
-            "‘{name}’ 계정을 이 PC에서 영구 삭제합니다.\n원본 시크릿키가 없으면 다시 등록할 수 없습니다. 계속하려면 비밀번호를 입력하세요."
+            "‘{shown}’ 계정을 이 PC에서 영구 삭제합니다.\n원본 시크릿키가 없으면 다시 등록할 수 없습니다. 계속하려면 비밀번호를 입력하세요."
         ),
         result: RefCell::new(None),
     };
@@ -2251,8 +2331,10 @@ unsafe fn command(hwnd: H, w: usize) {
         (IDOK, _) => {
             if with_app(|a| a.session.is_none()).unwrap_or(false) {
                 unlock(hwnd);
-            } else if let Some(Err(e)) = with_app(|a| copy_selected(a)) {
-                notice(hwnd, &e);
+            } else if let Some(Some(Err(e))) =
+                with_app(|a| selected_entry(a).map(|_| copy_selected(a)))
+            {
+                notice(hwnd, &e); // Enter with nothing selected does nothing.
             }
         }
         (IDCANCEL, _) => {
@@ -2293,11 +2375,13 @@ unsafe fn handle(hwnd: H, msg: u32, w: usize, l: isize) -> isize {
         }
         WM_DPICHANGED => {
             let old = create_fonts((w & 0xffff) as u32);
-            with_app(|a| {
+            let applied = with_app(|a| {
                 apply_fonts(&a.c);
-                SendMessageW(a.c.list, LB_SETITEMHEIGHT, 0, sc(ROW_HEIGHT) as isize);
+                SendMessageW(a.c.list, LB_SETITEMHEIGHT, 0, row_height() as isize);
             });
-            delete_fonts(old);
+            if applied.is_some() {
+                delete_fonts(old); // Only once no control still uses them.
+            }
             let r = &*(l as *const Rect);
             SetWindowPos(
                 hwnd,
@@ -2337,7 +2421,7 @@ unsafe fn handle(hwnd: H, msg: u32, w: usize, l: isize) -> isize {
             0
         }
         WM_MEASUREITEM => {
-            (*(l as *mut MeasureItem)).height = sc(ROW_HEIGHT) as u32;
+            (*(l as *mut MeasureItem)).height = row_height() as u32;
             1
         }
         WM_DRAWITEM => {
@@ -2398,15 +2482,23 @@ unsafe fn shortcut(hwnd: H, msg: &Msg) -> bool {
     else {
         return false;
     };
+    // AltGr is reported as Ctrl+Alt: never treat it as a Ctrl shortcut, or
+    // typing characters such as ł or ń into a password field would trigger one.
+    if GetKeyState(0x12) < 0 {
+        return false; // VK_MENU (Alt) held
+    }
+    if !unlocked {
+        return false; // Ctrl+L while locked would only wipe the typed password.
+    }
     let ctrl = GetKeyState(0x11) < 0;
     let key = msg.wparam as i32;
     let id = match (ctrl, key) {
         (true, 0x4C) => ID_LOCK,                        // Ctrl+L
         (true, 0x46) => ID_FOCUS_SEARCH,                // Ctrl+F
-        (true, 0x4E) if unlocked => ID_ADD,             // Ctrl+N
+        (true, 0x4E) => ID_ADD,                         // Ctrl+N
         (true, 0x43) if msg.hwnd == list => ID_COPY,    // Ctrl+C
         (false, 0x2E) if msg.hwnd == list => ID_DELETE, // Delete
-        (false, 0x28) if msg.hwnd == search => {
+        (false, 0x28) if msg.hwnd == search && IsWindowVisible(list) != 0 => {
             // Down arrow moves from the search box into the list.
             SetFocus(list);
             return true;

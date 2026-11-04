@@ -18,7 +18,7 @@ const MAX_SECRET_BYTES: usize = 4096;
 pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
     // A limit prevents accidentally pasting extremely large inputs into a secret field.
     if input.len() > 8192 {
-        return Err("Base32 key is too long".into());
+        return Err("비밀키가 너무 깁니다.".into());
     }
     let mut values = SensitiveVec(Vec::with_capacity(input.len()));
     let mut padding = 0usize;
@@ -33,20 +33,26 @@ pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
             continue;
         }
         if seen_padding {
-            return Err("Base32 padding must be at the end".into());
+            return Err("Base32 패딩(=)은 끝에만 올 수 있습니다.".into());
         }
         let value = match c.to_ascii_uppercase() {
             b'A'..=b'Z' => c.to_ascii_uppercase() - b'A',
             b'2'..=b'7' => c - b'2' + 26,
-            _ => return Err("Invalid Base32 character".into()),
+            b'0' | b'1' | b'8' | b'9' => {
+                return Err(
+                    "숫자 0, 1, 8, 9는 Base32에 없습니다. O, I, B 등을 잘못 읽었는지 확인하세요."
+                        .into(),
+                )
+            }
+            _ => return Err("Base32에 사용할 수 없는 문자가 있습니다. (A–Z, 2–7만 가능)".into()),
         };
         values.0.push(value);
         if values.0.len() > (MAX_SECRET_BYTES * 8).div_ceil(5) {
-            return Err("Base32 key is too long".into());
+            return Err("비밀키가 너무 깁니다.".into());
         }
     }
     if values.0.is_empty() {
-        return Err("Base32 key is empty".into());
+        return Err("비밀키가 비어 있습니다.".into());
     }
     let remainder = values.0.len() % 8;
     let expected_padding = match remainder {
@@ -55,10 +61,14 @@ pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
         4 => 4,
         5 => 3,
         7 => 1,
-        _ => return Err("Invalid Base32 length".into()),
+        _ => {
+            return Err(
+                "비밀키 길이가 올바르지 않습니다. 빠지거나 더 들어간 글자를 확인하세요.".into(),
+            )
+        }
     };
     if padding != 0 && padding != expected_padding {
-        return Err("Invalid Base32 padding".into());
+        return Err("Base32 패딩(=) 개수가 올바르지 않습니다.".into());
     }
     let mut out = Vec::with_capacity(values.0.len() * 5 / 8);
     let mut accumulator = 0u32;
@@ -72,13 +82,141 @@ pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
             accumulator &= (1 << bits) - 1;
         }
     }
-    // Nonzero unused bits encode an ambiguous, noncanonical value.
-    let invalid = accumulator != 0;
-    if invalid {
-        wipe(&mut out);
-        return Err("Invalid Base32 trailing bits".into());
+    // Unused trailing bits are ignored, as other authenticator apps do. Secrets
+    // generated as random Base32 characters (for example 26 or 52 characters)
+    // often have nonzero trailing bits and must still produce the same codes.
+    Ok(out)
+}
+
+/// Parameters from an `otpauth://totp/...` link. The secret is cleared on drop.
+pub struct OtpAuth {
+    pub name: String,
+    pub secret: Vec<u8>,
+    pub algorithm: Algorithm,
+    pub digits: u32,
+    pub period: u64,
+}
+impl Drop for OtpAuth {
+    fn drop(&mut self) {
+        wipe(&mut self.secret);
+    }
+}
+
+fn percent_decode(input: &str, plus_is_space: bool) -> Result<SensitiveVec, String> {
+    let bytes = input.as_bytes();
+    let mut out = SensitiveVec(Vec::with_capacity(bytes.len()));
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let value = bytes
+                    .get(i + 1..i + 3)
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    .ok_or("otpauth 링크의 % 인코딩이 올바르지 않습니다.")?;
+                out.0.push(value);
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.0.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.0.push(b);
+                i += 1;
+            }
+        }
     }
     Ok(out)
+}
+
+fn percent_decode_text(input: &str, plus_is_space: bool) -> Result<String, String> {
+    let raw = percent_decode(input, plus_is_space)?;
+    std::str::from_utf8(&raw.0)
+        .map(str::to_string)
+        .map_err(|_| "otpauth 링크의 문자 인코딩이 올바르지 않습니다.".into())
+}
+
+/// Parse a Key URI (`otpauth://totp/Issuer:account?secret=...`). Only TOTP is
+/// accepted. Missing parameters take the standard defaults (SHA-1, 6, 30).
+pub fn parse_otpauth(uri: &str) -> Result<OtpAuth, String> {
+    const SCHEME: &str = "otpauth://";
+    let uri = uri.trim();
+    if uri.len() > 16384 {
+        return Err("otpauth 링크가 너무 깁니다.".into());
+    }
+    if !uri
+        .get(..SCHEME.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(SCHEME))
+    {
+        return Err("otpauth:// 링크가 아닙니다.".into());
+    }
+    let (kind, rest) = uri[SCHEME.len()..]
+        .split_once('/')
+        .ok_or("otpauth 링크 형식이 올바르지 않습니다.")?;
+    if kind.eq_ignore_ascii_case("hotp") {
+        return Err("HOTP(카운터 방식) 링크는 지원하지 않습니다.".into());
+    }
+    if !kind.eq_ignore_ascii_case("totp") {
+        return Err("TOTP 링크가 아닙니다.".into());
+    }
+    let (label, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let label = percent_decode_text(label, false)?;
+    let mut secret: Option<SensitiveVec> = None;
+    let mut issuer = String::new();
+    let mut algorithm = Algorithm::Sha1;
+    let mut digits = 6u32;
+    let mut period = 30u64;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key.to_ascii_lowercase().as_str() {
+            "secret" => {
+                let raw = percent_decode(value, true)?;
+                let text = std::str::from_utf8(&raw.0)
+                    .map_err(|_| "Base32에 사용할 수 없는 문자가 있습니다.".to_string())?;
+                secret = Some(SensitiveVec(decode_base32(text)?));
+            }
+            "issuer" => issuer = percent_decode_text(value, true)?,
+            "algorithm" => {
+                algorithm = match value.to_ascii_uppercase().replace('-', "").as_str() {
+                    "SHA1" => Algorithm::Sha1,
+                    "SHA256" => Algorithm::Sha256,
+                    "SHA512" => Algorithm::Sha512,
+                    _ => return Err(format!("지원하지 않는 알고리즘입니다: {value}")),
+                }
+            }
+            "digits" => {
+                digits = value
+                    .parse()
+                    .map_err(|_| format!("자릿수 값이 올바르지 않습니다: {value}"))?
+            }
+            "period" => {
+                period = value
+                    .parse()
+                    .map_err(|_| format!("주기 값이 올바르지 않습니다: {value}"))?
+            }
+            _ => {}
+        }
+    }
+    let mut secret = secret.ok_or("링크에 secret 값이 없습니다.")?;
+    let label = label.trim();
+    let issuer = issuer.trim();
+    let name = if label.is_empty() {
+        issuer.to_string()
+    } else if let Some((prefix, account)) = label.split_once(':') {
+        format!("{}:{}", prefix.trim(), account.trim())
+    } else if !issuer.is_empty() && label != issuer {
+        format!("{issuer}:{label}")
+    } else {
+        label.to_string()
+    };
+    Ok(OtpAuth {
+        name,
+        secret: std::mem::take(&mut secret.0),
+        algorithm,
+        digits,
+        period,
+    })
 }
 
 /// RFC 6238. The caller owns the secret and is responsible for clearing it.
@@ -263,7 +401,6 @@ mod tests {
         for encoded in [
             "",
             "A",
-            "MZ",
             "MZX",
             "MZXW6Y",
             "MY=",
@@ -278,6 +415,9 @@ mod tests {
             assert!(decode_base32(encoded).is_err(), "accepted {encoded}");
         }
         assert_eq!(decode_base32("my").unwrap(), b"f");
+        // Nonzero unused trailing bits are ignored like other authenticators.
+        assert_eq!(decode_base32("MZ").unwrap(), b"f");
+        assert_eq!(decode_base32("MZ======").unwrap(), b"f");
         assert_eq!(
             decode_base32(&"A".repeat(6554)).unwrap().len(),
             MAX_SECRET_BYTES
@@ -349,6 +489,40 @@ mod tests {
         );
         assert!(totp(&vec![0x42; 4096], 0, 30, 6, Algorithm::Sha1).is_ok());
         assert!(totp(&vec![0x42; 4097], 0, 30, 6, Algorithm::Sha1).is_err());
+    }
+
+    #[test]
+    fn otpauth_links() {
+        let p = parse_otpauth(
+            "otpauth://totp/Example:alice%40google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+        )
+        .unwrap();
+        assert_eq!(p.name, "Example:alice@google.com");
+        assert_eq!(p.secret, b"Hello!\xde\xad\xbe\xef");
+        assert_eq!((p.algorithm, p.digits, p.period), (Algorithm::Sha1, 6, 30));
+        let p = parse_otpauth(
+            "OTPAUTH://TOTP/alice?issuer=My+Org&secret=jbswy3dpehpk3pxp&algorithm=SHA256&digits=8&period=60",
+        )
+        .unwrap();
+        assert_eq!(p.name, "My Org:alice");
+        assert_eq!(
+            (p.algorithm, p.digits, p.period),
+            (Algorithm::Sha256, 8, 60)
+        );
+        let p = parse_otpauth("otpauth://totp/?secret=MZXW6&issuer=Solo").unwrap();
+        assert_eq!(p.name, "Solo");
+        assert_eq!(p.secret, b"foo");
+        for bad in [
+            "https://example.com/?secret=MZXW6",
+            "otpauth://hotp/x?secret=MZXW6&counter=1",
+            "otpauth://totp/x?issuer=a",
+            "otpauth://totp/x%zz?secret=MZXW6",
+            "otpauth://totp/x?secret=MZXW6&algorithm=MD5",
+            "otpauth://totp/x?secret=MZXW6&digits=six",
+            "otpauth://totp/x?secret=MZ0W6",
+        ] {
+            assert!(parse_otpauth(bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

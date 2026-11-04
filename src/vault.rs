@@ -1,7 +1,7 @@
 //! Windows-only TPM-bound vault. No plaintext is written by this module.
 //!
-//! `decrypt` never creates a key. A caller must NOT call `encrypt` to initialize
-//! an existing vault after a failed decrypt: a missing TPM key is permanent loss.
+//! `open` never creates a key. A caller must NOT call `create` to initialize
+//! an existing vault after a failed open: a missing TPM key is permanent loss.
 //! This provides no isolation from malware running as this user or administrator.
 
 use std::{ffi::c_void, ptr};
@@ -378,7 +378,7 @@ fn tpm_key(create: bool) -> Result<N, String> {
         "TPM provider type",
     )?;
     if got != 4 || implementation & 1 == 0 {
-        return Err("TPM hardware provider unavailable".into());
+        return Err("TPM 하드웨어 암호화 공급자를 사용할 수 없습니다.".into());
     }
     let mut h = ptr::null_mut();
     #[cfg(not(test))]
@@ -390,7 +390,10 @@ fn tpm_key(create: bool) -> Result<N, String> {
         return check_key(N(h));
     }
     if !create || !matches!(status as u32, NTE_BAD_KEYSET | NTE_NOT_FOUND) {
-        return Err(format!("TPM key unavailable: 0x{:08x}", status as u32));
+        return Err(format!(
+            "이 Windows 사용자의 TPM 보관함 키를 열 수 없습니다 (0x{:08x}).",
+            status as u32
+        ));
     }
     let status =
         unsafe { NCryptCreatePersistedKey(p.0, &mut h, wide("RSA").as_ptr(), name.as_ptr(), 0, 0) };
@@ -534,7 +537,7 @@ fn rsa(key: &N, input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 }
 fn password_key(password: &str, salt: &[u8]) -> Result<Secret<32>, String> {
     if password.is_empty() || password.len() > 4096 {
-        return Err("Password must contain 1 to 4096 UTF-8 bytes".into());
+        return Err("비밀번호는 1~4096바이트여야 합니다.".into());
     }
     let a = alg("SHA256", 8)?;
     let mut key = Secret([0; 32]);
@@ -632,58 +635,110 @@ fn aes(
     Ok(out)
 }
 
-/// Generate a fresh salt, nonce and TPM-wrapped random key per write.
-pub fn encrypt(password: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    validate_inputs(password, plaintext)?;
-    encrypt_with_key(password, plaintext, tpm_key(true)?)
+/// The password-derived half of the vault key. It is kept only while the vault
+/// is open, so that adding an account does not require retyping the password,
+/// and it is wiped on drop. It never leaves this process and cannot decrypt a
+/// vault without the non-exportable TPM key.
+pub struct VaultKey {
+    password: Secret<32>,
+    salt: [u8; 32],
+}
+impl VaultKey {
+    fn derive(password: &str, salt: [u8; 32]) -> Result<Self, String> {
+        Ok(VaultKey {
+            password: password_key(password, &salt)?,
+            salt,
+        })
+    }
+    /// Re-derive from a typed password and compare in constant time. Used to
+    /// confirm destructive changes such as deleting an account.
+    pub fn matches_password(&self, password: &str) -> Result<bool, String> {
+        let other = password_key(password, &self.salt)?;
+        let mut diff = 0u8;
+        for (a, b) in other.0.iter().zip(self.password.0.iter()) {
+            diff |= a ^ b;
+        }
+        Ok(std::hint::black_box(diff) == 0)
+    }
 }
 
-/// Re-encrypt an existing vault only with the TPM key that created it.
-/// Never create a replacement key when modifying an existing vault.
-pub fn encrypt_existing(
-    password: &str,
-    plaintext: &[u8],
-    existing: &[u8],
-) -> Result<Vec<u8>, String> {
-    validate_inputs(password, plaintext)?;
-    validate_blob(existing)?;
-    let key = tpm_key(false)?;
-    if key_id(&key)? != existing[52..84] {
-        return Err("Vault belongs to another TPM key".into());
-    }
-    // Ensure that a corrupted, replaced or differently password-protected vault
-    // is not silently overwritten. The verified plaintext is not retained.
-    let mut verified = decrypt(password, existing)?;
-    wipe(&mut verified);
-    encrypt_with_key(password, plaintext, key)
-}
-
-fn validate_inputs(password: &str, plaintext: &[u8]) -> Result<(), String> {
-    if plaintext.len() > MAX_CIPHER {
-        return Err("Vault too large".into());
-    }
+fn check_password(password: &str) -> Result<(), String> {
     if password.is_empty() || password.len() > 4096 {
-        return Err("Password must contain 1 to 4096 UTF-8 bytes".into());
+        return Err("비밀번호는 1~4096바이트여야 합니다.".into());
     }
     Ok(())
 }
 
-fn encrypt_with_key(password: &str, plaintext: &[u8], key: N) -> Result<Vec<u8>, String> {
-    let id = key_id(&key)?;
+fn check_plaintext(plaintext: &[u8]) -> Result<(), String> {
+    if plaintext.len() > MAX_CIPHER {
+        return Err("보관함이 너무 큽니다.".into());
+    }
+    Ok(())
+}
+
+fn check_owner(tpm: &N, blob: &[u8]) -> Result<(), String> {
+    if key_id(tpm)? != blob[52..84] {
+        return Err(
+            "이 보관함은 다른 TPM 키(다른 PC 또는 Windows 사용자)로 만들어졌습니다.".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Create a new vault with a fresh salt and a new TPM key if none exists.
+pub fn create(password: &str, plaintext: &[u8]) -> Result<(Vec<u8>, VaultKey), String> {
+    check_password(password)?;
+    check_plaintext(plaintext)?;
+    let tpm = tpm_key(true)?;
     let mut salt = [0u8; 32];
-    let mut nonce = [0u8; 12];
     random(&mut salt)?;
+    let key = VaultKey::derive(password, salt)?;
+    let blob = seal(&tpm, &key, plaintext)?;
+    Ok((blob, key))
+}
+
+/// Open an existing vault. Never creates a TPM key.
+pub fn open(password: &str, blob: &[u8]) -> Result<(Vec<u8>, VaultKey), String> {
+    validate_blob(blob)?;
+    check_password(password)?;
+    let tpm = tpm_key(false)?;
+    check_owner(&tpm, blob)?;
+    let key = VaultKey::derive(password, blob[8..40].try_into().unwrap())?;
+    let plaintext = unseal(&tpm, &key, blob)?;
+    Ok((plaintext, key))
+}
+
+/// Re-encrypt an existing vault only with the TPM key and password that opened
+/// it. The existing blob is decrypted first so that a corrupted, replaced or
+/// differently protected vault is never silently overwritten. Each write uses
+/// a fresh random TPM-wrapped secret and nonce; the salt is kept.
+pub fn reencrypt(key: &VaultKey, plaintext: &[u8], existing: &[u8]) -> Result<Vec<u8>, String> {
+    check_plaintext(plaintext)?;
+    validate_blob(existing)?;
+    if existing[8..40] != key.salt {
+        return Err("보관함이 다른 비밀번호로 다시 저장되었습니다. 잠근 뒤 다시 여세요.".into());
+    }
+    let tpm = tpm_key(false)?;
+    check_owner(&tpm, existing)?;
+    let mut verified = unseal(&tpm, key, existing)?;
+    wipe(&mut verified);
+    seal(&tpm, key, plaintext)
+}
+
+fn seal(tpm: &N, key: &VaultKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let id = key_id(tpm)?;
+    let mut nonce = [0u8; 12];
     random(&mut nonce)?;
     let mut secret = Secret([0u8; 32]);
     random(&mut secret.0)?;
-    let wrapped = rsa(&key, &secret.0, true)?;
-    let mut derived = password_key(password, &salt)?;
+    let wrapped = rsa(tpm, &secret.0, true)?;
+    let mut derived = Secret(key.password.0);
     for i in 0..32 {
         derived.0[i] ^= secret.0[i];
     }
     let mut out = Vec::with_capacity(HEADER + wrapped.len() + plaintext.len() + TAG_LEN);
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&salt);
+    out.extend_from_slice(&key.salt);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&id);
     out.extend_from_slice(&(wrapped.len() as u32).to_le_bytes());
@@ -696,46 +751,113 @@ fn encrypt_with_key(password: &str, plaintext: &[u8], key: N) -> Result<Vec<u8>,
     Ok(out)
 }
 
+/// Fail closed if the TPM key, password, or authenticated data does not match.
+fn unseal(tpm: &N, key: &VaultKey, blob: &[u8]) -> Result<Vec<u8>, String> {
+    let (wrapped_len, end) = validate_blob(blob)?;
+    let mut raw = rsa(tpm, &blob[HEADER..HEADER + wrapped_len], false)?;
+    if raw.len() != 32 {
+        wipe(&mut raw);
+        return Err("보관함의 TPM 보호 키가 올바르지 않습니다.".into());
+    }
+    let mut derived = Secret(key.password.0);
+    for (d, r) in derived.0.iter_mut().zip(raw.iter()) {
+        *d ^= r;
+    }
+    wipe(&mut raw);
+    let data_start = HEADER + wrapped_len;
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&blob[end - 16..]);
+    aes(
+        &derived.0,
+        &blob[40..52],
+        &blob[..data_start],
+        &blob[data_start..end - 16],
+        &mut tag,
+        false,
+    )
+    .map_err(|_| "비밀번호가 올바르지 않거나 보관함 파일이 손상되었습니다.".into())
+}
+
+fn validate_blob(blob: &[u8]) -> Result<(usize, usize), String> {
+    if blob.len() < HEADER + TAG_LEN || &blob[..8] != MAGIC {
+        return Err("보관함 파일 형식이 올바르지 않습니다.".into());
+    }
+    let wrapped_len = u32::from_le_bytes(blob[84..88].try_into().unwrap()) as usize;
+    let data_len = u32::from_le_bytes(blob[88..92].try_into().unwrap()) as usize;
+    // The only supported format uses RSA-2048, so OAEP ciphertext is 256 bytes.
+    if wrapped_len != 256 || data_len > MAX_CIPHER {
+        return Err("보관함 파일 길이가 올바르지 않습니다.".into());
+    }
+    let end = HEADER
+        .checked_add(wrapped_len)
+        .and_then(|n| n.checked_add(data_len))
+        .and_then(|n| n.checked_add(TAG_LEN))
+        .ok_or("보관함 파일 길이가 올바르지 않습니다.")?;
+    if blob.len() != end {
+        return Err("보관함 파일 길이가 올바르지 않습니다.".into());
+    }
+    Ok((wrapped_len, end))
+}
+
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     // Opt-in only: this test creates (or reuses) a persistent key named
     // OtpMigration.WindowsOtp.SyntheticTestKey.<random> under the current Windows
     // account and does not delete it. Ordinary cargo test must never create,
-    // alter, or delete TPM keys. Never
-    // remove an existing key unless its ownership has been established.
+    // alter, or delete TPM keys. Never remove an existing key unless its
+    // ownership has been established.
     #[test]
     #[ignore = "creates a randomly named persistent synthetic TPM test key"]
     fn synthetic_roundtrip_and_tamper() {
         let message = b"synthetic vault test, no real secrets";
-        let blob = encrypt("synthetic-password", message).expect("TPM encrypt");
-        assert_eq!(decrypt("synthetic-password", &blob).unwrap(), message);
-        assert!(decrypt("wrong-password", &blob).is_err());
-        let updated = encrypt_existing("synthetic-password", b"updated", &blob).unwrap();
-        assert_eq!(decrypt("synthetic-password", &updated).unwrap(), b"updated");
-        assert!(encrypt_existing("wrong-password", b"updated", &blob).is_err());
+        let (blob, key) = create("synthetic-password", message).expect("TPM encrypt");
+        let (plain, opened) = open("synthetic-password", &blob).unwrap();
+        assert_eq!(plain, message);
+        assert!(opened.matches_password("synthetic-password").unwrap());
+        assert!(!opened.matches_password("wrong-password").unwrap());
+        assert!(open("wrong-password", &blob).is_err());
+        let updated = reencrypt(&key, b"updated", &blob).unwrap();
+        assert_eq!(updated[8..40], blob[8..40]);
+        assert_ne!(updated[40..52], blob[40..52]);
+        assert_eq!(open("synthetic-password", &updated).unwrap().0, b"updated");
+        let (_, wrong) = create("wrong-password", b"other").unwrap();
+        assert!(reencrypt(&wrong, b"updated", &blob).is_err());
         let mut corrupted = blob.clone();
         let end = corrupted.len();
         corrupted[end - 17] ^= 1;
-        assert!(decrypt("synthetic-password", &corrupted).is_err());
-        assert!(encrypt_existing("synthetic-password", b"updated", &corrupted).is_err());
+        assert!(open("synthetic-password", &corrupted).is_err());
+        assert!(reencrypt(&key, b"updated", &corrupted).is_err());
         let mut corrupted = blob.clone();
         corrupted[8] ^= 1;
-        assert!(decrypt("synthetic-password", &corrupted).is_err());
+        assert!(open("synthetic-password", &corrupted).is_err());
+        assert!(reencrypt(&key, b"updated", &corrupted).is_err());
         let mut wrong_key = blob.clone();
         wrong_key[52] ^= 1;
-        assert!(encrypt_existing("synthetic-password", b"updated", &wrong_key).is_err());
+        assert!(reencrypt(&key, b"updated", &wrong_key).is_err());
     }
+
     #[test]
     fn reject_malformed_header_without_accessing_tpm() {
-        assert!(decrypt("test-password", b"not a vault").is_err());
+        assert!(open("test-password", b"not a vault").is_err());
         let mut header = vec![0u8; HEADER + TAG_LEN];
         header[..8].copy_from_slice(MAGIC);
-        assert!(decrypt("test-password", &header).is_err());
+        assert!(open("test-password", &header).is_err());
         header[84..88].copy_from_slice(&256u32.to_le_bytes());
-        assert!(decrypt("test-password", &header).is_err());
-        assert!(encrypt_existing("test-password", b"data", &header).is_err());
+        assert!(open("test-password", &header).is_err());
+        let key = VaultKey {
+            password: Secret([0; 32]),
+            salt: [0; 32],
+        };
+        assert!(reencrypt(&key, b"data", &header).is_err());
+    }
+
+    #[test]
+    fn password_comparison_without_accessing_tpm() {
+        let key = VaultKey::derive("synthetic password", [7; 32]).unwrap();
+        assert!(key.matches_password("synthetic password").unwrap());
+        assert!(!key.matches_password("synthetic passwore").unwrap());
+        assert!(key.matches_password("").is_err());
     }
 
     #[test]
@@ -764,59 +886,4 @@ mod tests {
         tag[0] ^= 1;
         assert!(aes(&key, &nonce, &[], &ciphertext, &mut tag, false).is_err());
     }
-}
-/// Fail closed if the TPM key, password, or authenticated data does not match.
-fn validate_blob(blob: &[u8]) -> Result<(usize, usize), String> {
-    if blob.len() < HEADER + TAG_LEN || &blob[..8] != MAGIC {
-        return Err("Invalid vault header".into());
-    }
-    let wrapped_len = u32::from_le_bytes(blob[84..88].try_into().unwrap()) as usize;
-    let data_len = u32::from_le_bytes(blob[88..92].try_into().unwrap()) as usize;
-    // The only supported format uses RSA-2048, so OAEP ciphertext is 256 bytes.
-    if wrapped_len != 256 || data_len > MAX_CIPHER {
-        return Err("Invalid vault length".into());
-    }
-    let end = HEADER
-        .checked_add(wrapped_len)
-        .and_then(|n| n.checked_add(data_len))
-        .and_then(|n| n.checked_add(TAG_LEN))
-        .ok_or("Invalid vault length")?;
-    if blob.len() != end {
-        return Err("Invalid vault length".into());
-    }
-    Ok((wrapped_len, end))
-}
-
-pub fn decrypt(password: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
-    let (wrapped_len, end) = validate_blob(blob)?;
-    if password.is_empty() || password.len() > 4096 {
-        return Err("Password must contain 1 to 4096 UTF-8 bytes".into());
-    }
-    let key = tpm_key(false)?;
-    if key_id(&key)? != blob[52..84] {
-        return Err("Vault belongs to another TPM key".into());
-    }
-    let mut raw = rsa(&key, &blob[HEADER..HEADER + wrapped_len], false)?;
-    if raw.len() != 32 {
-        wipe(&mut raw);
-        return Err("Invalid wrapped key".into());
-    }
-    let mut secret = Secret([0u8; 32]);
-    secret.0.copy_from_slice(&raw);
-    wipe(&mut raw);
-    let mut derived = password_key(password, &blob[8..40])?;
-    for i in 0..32 {
-        derived.0[i] ^= secret.0[i];
-    }
-    let data_start = HEADER + wrapped_len;
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&blob[end - 16..]);
-    aes(
-        &derived.0,
-        &blob[40..52],
-        &blob[..data_start],
-        &blob[data_start..end - 16],
-        &mut tag,
-        false,
-    )
 }

@@ -35,6 +35,37 @@ fn resource(out: &mut Vec<u8>, kind: u16, id: u16, data: &[u8]) {
     out.extend_from_slice(data);
     align(out);
 }
+// Themed common controls (v6), per-monitor DPI awareness and no elevation.
+const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="LocalOtp" version="1.0.0.0"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
+"#;
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/local-otp.ico");
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
@@ -76,6 +107,7 @@ fn main() {
         resource(&mut res, 3, (i + 1) as u16, &ico[offset..offset + len]); // RT_ICON
     }
     resource(&mut res, 14, 1, &group); // RT_GROUP_ICON, ID 1
+    resource(&mut res, 24, 1, MANIFEST.as_bytes()); // RT_MANIFEST, process manifest
     let path = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("local-otp.res");
     fs::write(&path, res).expect("could not write icon resources");
     println!("cargo:rustc-link-arg-bin=local-otp={}", path.display());

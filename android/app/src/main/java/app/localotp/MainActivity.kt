@@ -32,6 +32,16 @@ class LocalOtpApp : Application() {
     lateinit var vault: VaultController
         private set
 
+    /**
+     * Sent when the process moves to the background LRU list, before Android
+     * may freeze it: lock now so keys never sit in a frozen process's memory.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        @Suppress("DEPRECATION")
+        if (level >= TRIM_MEMORY_BACKGROUND) vault.lock(VaultController.LOCKED_BACKGROUND)
+    }
+
     override fun onCreate() {
         super.onCreate()
         vault = VaultController(this)
@@ -43,7 +53,9 @@ class LocalOtpApp : Application() {
                     // the screen is back on and the user is unlocking again;
                     // then it is stale (onStop already locked) and must not
                     // cancel the unlock in progress.
-                    if (!getSystemService(PowerManager::class.java).isInteractive) {
+                    // While the app is in the background, a held-back broadcast
+                    // still locks: nothing can be unlocking then.
+                    if (!getSystemService(PowerManager::class.java).isInteractive || !vault.inForeground) {
                         vault.lock(VaultController.LOCKED_SCREEN)
                     }
                 }

@@ -1367,6 +1367,13 @@ unsafe fn unlock(hwnd: H) {
     match result {
         Ok(session) => {
             with_app(move |a| {
+                // A lock (e.g. suspend) can be delivered while the slow unlock
+                // ran or by discard_typeahead's PeekMessage; never open after it.
+                if a.generation != generation {
+                    drop(session); // Wipes the derived key and the secrets.
+                    show_page(a);
+                    return;
+                }
                 a.session = Some(session);
                 a.last_activity = Instant::now();
                 a.filter.clear();

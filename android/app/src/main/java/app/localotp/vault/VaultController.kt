@@ -92,6 +92,7 @@ class VaultController(context: Context) {
     private var session: Session? = null
     private var generation = 0L
     private var foreground = true
+    val inForeground: Boolean get() = foreground
     private var stoppedAt = 0L
     private var lastActivity = SystemClock.elapsedRealtime()
     private var clipboardPending = false
@@ -123,7 +124,11 @@ class VaultController(context: Context) {
         foreground = false
         stoppedAt = SystemClock.elapsedRealtime()
         main.removeCallbacks(backgroundLock)
-        if (session != null) main.postDelayed(backgroundLock, BACKGROUND_MS)
+        if (session != null) {
+            main.postDelayed(backgroundLock, BACKGROUND_MS)
+            // The Handler never runs if the process is frozen; the alarm does.
+            BackgroundLockReceiver.schedule(app, BACKGROUND_MS)
+        }
     }
 
     /**
@@ -135,6 +140,7 @@ class VaultController(context: Context) {
     fun onForeground() {
         foreground = true
         main.removeCallbacks(backgroundLock)
+        BackgroundLockReceiver.cancel(app)
         val now = SystemClock.elapsedRealtime()
         if (session != null && stoppedAt > 0 && now - stoppedAt >= BACKGROUND_MS) lock(LOCKED_BACKGROUND)
         if (clipboardPending && now - copiedAt >= CLIPBOARD_MS) clearClipboardIfOurs()
@@ -145,6 +151,7 @@ class VaultController(context: Context) {
         android.util.Log.i(TAG, "lock: $reason (open=${session != null})")
         generation++
         main.removeCallbacks(backgroundLock)
+        BackgroundLockReceiver.cancel(app)
         session?.wipe()
         session = null
         clearClipboardIfOurs()
@@ -170,7 +177,10 @@ class VaultController(context: Context) {
         touch()
         // Opened while the app was already in the background (e.g. behind the
         // device-credential screen): the background timer still applies.
-        if (!foreground) main.postDelayed(backgroundLock, BACKGROUND_MS)
+        if (!foreground) {
+            main.postDelayed(backgroundLock, BACKGROUND_MS)
+            BackgroundLockReceiver.schedule(app, BACKGROUND_MS)
+        }
         publish()
     }
 

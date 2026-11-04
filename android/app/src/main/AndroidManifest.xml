@@ -35,6 +35,7 @@
             </intent-filter>
         </activity>
         <receiver android:name=".vault.ClipboardClearReceiver" android:exported="false" />
+        <receiver android:name=".vault.BackgroundLockReceiver" android:exported="false" />
         <!-- Not needed: an ADB-reachable profile installer and the emoji font
              downloader (an IPC to a networked provider). -->
         <receiver

@@ -5,7 +5,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 /** A user-facing validation or format error (Korean message). */
-class OtpException(message: String) : Exception(message)
+open class OtpException(message: String) : Exception(message)
 
 enum class Algorithm(val label: String, internal val mac: String, val code: Int) {
     SHA1("SHA-1", "HmacSHA1", 1),

@@ -19,8 +19,11 @@ import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -54,17 +57,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.localotp.otp.Totp
 import app.localotp.vault.AccountInfo
+import app.localotp.vault.Authenticator
 import app.localotp.vault.VaultController
 import app.localotp.vault.VaultState
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AccountsScreen(vault: VaultController, state: VaultState.Unlocked, now: Long, onAdd: () -> Unit) {
+fun AccountsScreen(vault: VaultController, auth: Authenticator, state: VaultState.Unlocked, now: Long, onAdd: () -> Unit) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val search = rememberTextFieldState()
     var deleting by remember { mutableStateOf<AccountInfo?>(null) }
+    var menu by remember { mutableStateOf(false) }
+    var quickDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -80,8 +86,20 @@ fun AccountsScreen(vault: VaultController, state: VaultState.Unlocked, now: Long
                     }
                 },
                 actions = {
-                    IconButton(onClick = { vault.lock(VaultController.LOCKED) }) {
+                    IconButton(onClick = { vault.lock(VaultController.LOCKED_MANUAL) }) {
                         Icon(Icons.Filled.Lock, contentDescription = "잠그기")
+                    }
+                    IconButton(onClick = { menu = true }) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "설정")
+                    }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(
+                            text = { Text(if (state.quickEnabled) "지문 잠금 해제 끄기" else "지문 잠금 해제 켜기") },
+                            onClick = {
+                                menu = false
+                                quickDialog = true
+                            },
+                        )
                     }
                 },
             )
@@ -149,12 +167,91 @@ fun AccountsScreen(vault: VaultController, state: VaultState.Unlocked, now: Long
         }
     }
 
+    if (quickDialog) {
+        QuickUnlockDialog(vault, auth, state.quickEnabled, onClose = { quickDialog = false }, onChanged = { message ->
+            quickDialog = false
+            scope.launch { snackbar.showSnackbar(message) }
+        })
+    }
+
     deleting?.let { account ->
         DeleteDialog(vault, account, onClose = { deleting = null }, onDeleted = {
             deleting = null
             scope.launch { snackbar.showSnackbar("‘${account.name}’ 계정을 삭제했습니다.") }
         })
     }
+}
+
+@Composable
+private fun QuickUnlockDialog(
+    vault: VaultController,
+    auth: Authenticator,
+    enabled: Boolean,
+    onClose: () -> Unit,
+    onChanged: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val pass = rememberTextFieldState()
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    fun submit() {
+        if (busy) return
+        if (enabled) {
+            vault.disableQuick()
+            onChanged("지문 잠금 해제를 껐습니다.")
+            return
+        }
+        val p = pass.chars()
+        if (p.isEmpty()) {
+            error = "비밀번호를 입력하세요."
+            return
+        }
+        busy = true
+        scope.launch {
+            var ok = false
+            runVaultAction({ error = it }) {
+                vault.enableQuick(p, auth)
+                ok = true
+            }
+            p.fill('\u0000')
+            busy = false
+            if (ok) onChanged("지문 잠금 해제를 켰습니다.")
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onClose() },
+        title = { Text(if (enabled) "지문 잠금 해제 끄기" else "지문 잠금 해제 켜기") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (enabled) {
+                    Text("다음부터는 비밀번호와 화면 잠금 인증으로 엽니다.")
+                } else {
+                    Text(
+                        "등록된 지문만으로 보관함을 엽니다(얼굴·PIN은 사용하지 않음).\n" +
+                            "• 지문을 새로 등록하면 자동으로 꺼집니다.\n" +
+                            "• 비밀번호를 잊지 않도록 14일마다 한 번은 비밀번호가 필요합니다.\n" +
+                            "• 지문을 강제로 대게 할 수 있는 상황이 걱정되면 켜지 마세요.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedSecureTextField(
+                        state = pass,
+                        label = { Text("보관함 비밀번호") },
+                        enabled = !busy,
+                        onKeyboardAction = { submit() },
+                    )
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { submit() }, enabled = !busy) { Text(if (enabled) "끄기" else "켜기") }
+        },
+        dismissButton = {
+            TextButton(onClick = onClose, enabled = !busy) { Text("취소") }
+        },
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)

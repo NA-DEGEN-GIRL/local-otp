@@ -10,6 +10,7 @@ import android.hardware.biometrics.BiometricPrompt
 import android.os.Build
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -51,6 +52,13 @@ class MainActivity : ComponentActivity() {
         // No screenshots, screen recording, casting or recents thumbnail.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
+        // Hide other apps' overlay windows over ours (tapjacking, fake prompts).
+        window.setHideOverlayWindows(true)
+        // Only real assistive tools (e.g. TalkBack) may read the screen;
+        // other accessibility services, a common spyware route, see nothing.
+        if (Build.VERSION.SDK_INT >= 34) {
+            window.decorView.setAccessibilityDataSensitive(View.ACCESSIBILITY_DATA_SENSITIVE_YES)
+        }
         enableEdgeToEdge()
         setContent {
             LocalOtpTheme {
@@ -76,15 +84,26 @@ class MainActivity : ComponentActivity() {
         vault.touch()
     }
 
-    /** Authorize one Keystore operation with biometrics or the screen lock. */
-    private suspend fun authenticate(cipher: Cipher, title: String): Cipher =
+    /**
+     * Authorize one Keystore operation. Biometric-only prompts (quick unlock)
+     * offer no screen-lock fallback; the user can fall back to the password.
+     */
+    private suspend fun authenticate(cipher: Cipher, title: String, biometricOnly: Boolean): Cipher =
         suspendCancellableCoroutine { cont ->
-            val prompt = BiometricPrompt.Builder(this)
+            val builder = BiometricPrompt.Builder(this)
                 .setTitle(title)
-                .setSubtitle("지문·얼굴 또는 화면 잠금으로 확인하세요")
-                .setAllowedAuthenticators(Authenticators.BIOMETRIC_STRONG or Authenticators.DEVICE_CREDENTIAL)
                 .setConfirmationRequired(false)
-                .build()
+            if (biometricOnly) {
+                builder.setSubtitle("등록된 지문으로 확인하세요")
+                    .setAllowedAuthenticators(Authenticators.BIOMETRIC_STRONG)
+                    .setNegativeButton("비밀번호 사용", mainExecutor) { _, _ ->
+                        if (cont.isActive) cont.resumeWithException(AuthCancelled())
+                    }
+            } else {
+                builder.setSubtitle("지문·얼굴 또는 화면 잠금으로 확인하세요")
+                    .setAllowedAuthenticators(Authenticators.BIOMETRIC_STRONG or Authenticators.DEVICE_CREDENTIAL)
+            }
+            val prompt = builder.build()
             val cancel = CancellationSignal()
             cont.invokeOnCancellation { cancel.cancel() }
             prompt.authenticate(
@@ -94,6 +113,7 @@ class MainActivity : ComponentActivity() {
                 object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                         val authorized = result.cryptoObject?.cipher
+                        if (!cont.isActive) return
                         if (authorized == null) {
                             cont.resumeWithException(OtpException("인증 결과에 보안 키 작업이 없습니다."))
                         } else {
@@ -102,8 +122,10 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        if (!cont.isActive) return
                         val cancelled = errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED ||
-                            errorCode == BiometricPrompt.BIOMETRIC_ERROR_CANCELED
+                            errorCode == BiometricPrompt.BIOMETRIC_ERROR_CANCELED ||
+                            errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED
                         cont.resumeWithException(
                             if (cancelled) AuthCancelled() else OtpException("인증 실패: $errString")
                         )

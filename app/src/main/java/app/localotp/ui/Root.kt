@@ -32,13 +32,13 @@ private sealed interface Page {
 fun LocalOtpRoot(vault: VaultController, auth: Authenticator) {
     when (val state = vault.state.collectAsState().value) {
         VaultState.NoVault -> SetupScreen(vault, auth)
-        is VaultState.Locked -> UnlockScreen(vault, auth, state.reason)
-        is VaultState.Unlocked -> UnlockedPages(vault, state)
+        is VaultState.Locked -> UnlockScreen(vault, auth, state)
+        is VaultState.Unlocked -> UnlockedPages(vault, auth, state)
     }
 }
 
 @Composable
-private fun UnlockedPages(vault: VaultController, state: VaultState.Unlocked) {
+private fun UnlockedPages(vault: VaultController, auth: Authenticator, state: VaultState.Unlocked) {
     // One clock for all codes, aligned to the start of each second.
     var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
     LaunchedEffect(Unit) {
@@ -71,7 +71,7 @@ private fun UnlockedPages(vault: VaultController, state: VaultState.Unlocked) {
     if (page != Page.List) BackHandler { go(Page.List) }
     val names = state.accounts.map { it.name }
     when (val p = page) {
-        Page.List -> AccountsScreen(vault, state, now, onAdd = { go(Page.Add(null)) })
+        Page.List -> AccountsScreen(vault, auth, state, now, onAdd = { go(Page.Add(null)) })
         is Page.Add -> AddScreen(
             vault = vault,
             draft = p.draft,

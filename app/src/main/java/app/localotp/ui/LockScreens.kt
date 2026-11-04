@@ -21,6 +21,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -28,6 +29,7 @@ import androidx.compose.material3.OutlinedSecureTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,7 +42,11 @@ import androidx.compose.ui.unit.dp
 import app.localotp.otp.OtpException
 import app.localotp.vault.AuthCancelled
 import app.localotp.vault.Authenticator
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.localotp.vault.VaultController
+import app.localotp.vault.VaultState
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /** Copy a text field into a CharArray that the caller clears. */
@@ -151,11 +157,30 @@ fun SetupScreen(vault: VaultController, auth: Authenticator) {
 }
 
 @Composable
-fun UnlockScreen(vault: VaultController, auth: Authenticator, reason: String) {
+fun UnlockScreen(vault: VaultController, auth: Authenticator, state: VaultState.Locked) {
     val scope = rememberCoroutineScope()
     val pass = rememberTextFieldState()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+
+    fun quick() {
+        if (busy) return
+        busy = true
+        scope.launch {
+            runVaultAction({ error = it }) { vault.quickUnlock(auth) }
+            busy = false
+        }
+    }
+
+    // Offer the fingerprint prompt once per lock, when the app is in front,
+    // except right after the user locked it on purpose.
+    LaunchedEffect(state) {
+        if (state.quick && state.reason != VaultController.LOCKED_MANUAL) {
+            lifecycle.currentStateFlow.first { it.isAtLeast(Lifecycle.State.RESUMED) }
+            quick()
+        }
+    }
 
     fun submit() {
         if (busy) return
@@ -187,7 +212,7 @@ fun UnlockScreen(vault: VaultController, auth: Authenticator, reason: String) {
             Spacer(Modifier.height(48.dp))
             Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.primary)
             Text("Local OTP", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text(reason, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(state.reason, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(8.dp))
             OutlinedSecureTextField(
                 state = pass,
@@ -198,10 +223,19 @@ fun UnlockScreen(vault: VaultController, auth: Authenticator, reason: String) {
             )
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Button(onClick = { submit() }, enabled = !busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                if (busy) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp) else Text("잠금 해제")
+                if (busy) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp) else Text("비밀번호로 열기")
+            }
+            if (state.quick) {
+                FilledTonalButton(onClick = { quick() }, enabled = !busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                    Text("지문으로 열기")
+                }
+            } else {
+                state.quickNote?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary)
+                }
             }
             Text(
-                "비밀번호와 지문·얼굴 또는 화면 잠금이 모두 필요합니다.\n5분 동안 사용하지 않거나, 화면이 꺼지거나, 앱을 벗어나면 잠깁니다.",
+                "비밀번호로 열 때는 지문·얼굴 또는 화면 잠금도 함께 필요합니다.\n5분 동안 사용하지 않거나, 화면이 꺼지거나, 앱을 벗어나면 잠깁니다.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

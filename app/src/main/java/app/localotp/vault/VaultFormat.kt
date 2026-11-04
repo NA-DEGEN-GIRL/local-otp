@@ -217,3 +217,35 @@ object VaultFile {
         }
     }
 }
+
+/**
+ * Fingerprint quick unlock (optional), a separate file:
+ *
+ *     0  magic "LOTPQK01"       8
+ *     8  quick key id          16  (alias LocalOtp.Quick.<hex>)
+ *    24  Keystore GCM IV       12
+ *    36  encrypted P || K      80  (64 + 16-byte tag)
+ *
+ * AAD = magic, quick key id, and the vault's salt and key id, so the file only
+ * works with the vault it was made for. The quick key accepts strong
+ * biometrics only and is invalidated when a new fingerprint is enrolled.
+ */
+class QuickBlob(val keyId: ByteArray, val iv: ByteArray, val ciphertext: ByteArray) {
+    fun encode(): ByteArray = ByteBuffer.allocate(SIZE).put(MAGIC).put(keyId).put(iv).put(ciphertext).array()
+
+    companion object {
+        val MAGIC = "LOTPQK01".toByteArray(Charsets.US_ASCII)
+        const val SIZE = 116
+        const val PLAINTEXT = 64
+
+        fun aad(keyId: ByteArray, vault: VaultHeader): ByteArray =
+            ByteBuffer.allocate(8 + 16 + 32 + 16).put(MAGIC).put(keyId).put(vault.salt).put(vault.keyId).array()
+
+        fun decode(bytes: ByteArray): QuickBlob {
+            if (bytes.size != SIZE || !bytes.copyOfRange(0, 8).contentEquals(MAGIC)) {
+                throw OtpException("지문 잠금 해제 정보가 손상되었습니다.")
+            }
+            return QuickBlob(bytes.copyOfRange(8, 24), bytes.copyOfRange(24, 36), bytes.copyOfRange(36, SIZE))
+        }
+    }
+}

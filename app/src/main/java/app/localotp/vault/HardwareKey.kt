@@ -13,29 +13,52 @@ import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 
+/** The Keystore key can never be used again (screen lock removed, new fingerprint). */
+class KeyInvalidated : OtpException("보안 키가 영구히 무효화되었습니다.")
+
 /**
- * The non-exportable Android Keystore key that wraps the vault's random half.
- * Every use needs a fresh biometric or screen-lock authentication (no timeout),
- * the device must be unlocked, and software-only keys are refused.
+ * Non-exportable Android Keystore keys. Every use needs a fresh user
+ * authentication (no timeout), the device must be unlocked, and software-only
+ * keys are refused.
+ *
+ * - Vault key: wraps the random half S of the vault key. Biometric or screen lock.
+ * - Quick key: wraps the session keys for fingerprint-only unlock. Strong
+ *   biometrics only; invalidated when a new fingerprint is enrolled.
  */
 object HardwareKey {
     private const val STORE = "AndroidKeyStore"
-    private const val PREFIX = "LocalOtp.Vault."
+    private const val VAULT = "LocalOtp.Vault."
+    private const val QUICK = "LocalOtp.Quick."
 
     enum class Level(val label: String) {
         STRONGBOX("StrongBox 보안 칩"),
         TEE("TEE(보안 영역)"),
     }
 
-    fun alias(keyId: ByteArray) = PREFIX + keyId.joinToString("") { "%02x".format(it) }
+    private fun hex(id: ByteArray) = id.joinToString("") { "%02x".format(it) }
+    fun vaultAlias(keyId: ByteArray) = VAULT + hex(keyId)
+    fun quickAlias(keyId: ByteArray) = QUICK + hex(keyId)
 
     private fun store() = KeyStore.getInstance(STORE).apply { load(null) }
 
-    fun get(keyId: ByteArray): SecretKey? = store().getKey(alias(keyId), null) as SecretKey?
+    fun get(alias: String): SecretKey? = store().getKey(alias, null) as SecretKey?
 
-    /** Create the key for a new vault. Prefers StrongBox, never falls back to software. */
-    fun create(keyId: ByteArray): SecretKey {
-        val alias = alias(keyId)
+    fun createVaultKey(keyId: ByteArray): SecretKey = create(
+        vaultAlias(keyId),
+        KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
+        // Enrolling another fingerprint must not destroy the vault.
+        invalidatedByEnrollment = false,
+    )
+
+    fun createQuickKey(keyId: ByteArray): SecretKey = create(
+        quickAlias(keyId),
+        KeyProperties.AUTH_BIOMETRIC_STRONG,
+        // A newly enrolled fingerprint must not open the vault without the password.
+        invalidatedByEnrollment = true,
+    )
+
+    /** Prefers StrongBox, never falls back to software. */
+    private fun create(alias: String, authenticators: Int, invalidatedByEnrollment: Boolean): SecretKey {
         if (store().containsAlias(alias)) throw OtpException("같은 이름의 키가 이미 있습니다.")
         fun spec(strongBox: Boolean) = KeyGenParameterSpec.Builder(
             alias,
@@ -45,12 +68,8 @@ object HardwareKey {
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
             .setUserAuthenticationRequired(true)
-            .setUserAuthenticationParameters(
-                0,
-                KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
-            )
-            // Enrolling another fingerprint must not destroy the vault.
-            .setInvalidatedByBiometricEnrollment(false)
+            .setUserAuthenticationParameters(0, authenticators)
+            .setInvalidatedByBiometricEnrollment(invalidatedByEnrollment)
             .setUnlockedDeviceRequired(true)
             .setIsStrongBoxBacked(strongBox)
             .build()
@@ -64,13 +83,13 @@ object HardwareKey {
                 generator.generateKey()
             }
         } catch (e: java.security.GeneralSecurityException) {
-            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금(PIN·패턴·비밀번호)을 설정했는지 확인하세요. (${e.javaClass.simpleName})")
+            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금과 지문이 설정되어 있는지 확인하세요. (${e.javaClass.simpleName})")
         } catch (e: IllegalStateException) {
-            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금(PIN·패턴·비밀번호)을 먼저 설정하세요.")
+            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금과 지문이 설정되어 있는지 확인하세요.")
         }
         if (level(key) == null) {
-            delete(keyId)
-            throw OtpException("이 기기는 하드웨어 보안 키를 지원하지 않아 보관함을 만들 수 없습니다.")
+            delete(alias)
+            throw OtpException("이 기기는 하드웨어 보안 키를 지원하지 않습니다.")
         }
         return key
     }
@@ -85,9 +104,9 @@ object HardwareKey {
         }
     }
 
-    /** Only used to roll back a vault creation that did not complete. */
-    fun delete(keyId: ByteArray) {
-        store().deleteEntry(alias(keyId))
+    /** Only for an unfinished vault creation, or the quick key when turned off. */
+    fun delete(alias: String) {
+        store().deleteEntry(alias)
     }
 
     // Initialized only: AAD and data are passed after the user authenticates the
@@ -100,8 +119,6 @@ object HardwareKey {
     private fun cipher(setup: Cipher.() -> Unit): Cipher = try {
         Cipher.getInstance("AES/GCM/NoPadding").apply(setup)
     } catch (e: KeyPermanentlyInvalidatedException) {
-        throw OtpException(
-            "기기의 화면 잠금이 해제되었거나 보안 키가 무효화되어 이 보관함은 영구히 열 수 없습니다."
-        )
+        throw KeyInvalidated()
     }
 }

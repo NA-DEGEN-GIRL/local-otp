@@ -66,6 +66,26 @@ class VaultFormatTest {
     }
 
     @Test
+    fun quickBlobFormat() {
+        val blob = app.localotp.vault.QuickBlob(ByteArray(16) { 7 }, ByteArray(12) { 8 }, ByteArray(80) { 9 })
+        val bytes = blob.encode()
+        assertEquals(app.localotp.vault.QuickBlob.SIZE, bytes.size)
+        val back = app.localotp.vault.QuickBlob.decode(bytes)
+        assertArrayEquals(blob.keyId, back.keyId)
+        assertArrayEquals(blob.iv, back.iv)
+        assertArrayEquals(blob.ciphertext, back.ciphertext)
+        // The AAD ties the quick file to one vault (salt and key id).
+        val other = VaultHeader(VaultFile.ITERATIONS, ByteArray(32) { 5 }, ByteArray(16) { 2 }, ByteArray(12), ByteArray(48))
+        assertFalse(
+            app.localotp.vault.QuickBlob.aad(blob.keyId, header())
+                .contentEquals(app.localotp.vault.QuickBlob.aad(blob.keyId, other)),
+        )
+        assertThrows(OtpException::class.java) { app.localotp.vault.QuickBlob.decode(bytes.copyOf(115)) }
+        val bad = bytes.copyOf().also { it[0] = 0 }
+        assertThrows(OtpException::class.java) { app.localotp.vault.QuickBlob.decode(bad) }
+    }
+
+    @Test
     fun passwordKeyIsStableAndProviderIndependent() {
         // Known answer computed independently (Python hashlib): PBKDF2-SHA256
         // over the hex of the UTF-8 password, 100,000 iterations.

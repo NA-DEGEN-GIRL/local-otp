@@ -3,6 +3,7 @@ package app.localotp.vault
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.hardware.biometrics.BiometricManager
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
@@ -22,8 +23,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-/** Authorizes one Keystore operation through BiometricPrompt and returns the cipher. */
-typealias Authenticator = suspend (cipher: Cipher, title: String) -> Cipher
+/**
+ * Authorizes one Keystore operation through BiometricPrompt and returns the
+ * cipher. `biometricOnly` allows strong biometrics only (no screen-lock PIN).
+ */
+typealias Authenticator = suspend (cipher: Cipher, title: String, biometricOnly: Boolean) -> Cipher
 
 /** The user dismissed the biometric/screen-lock prompt; not an error. */
 class AuthCancelled : Exception()
@@ -38,8 +42,15 @@ data class AccountInfo(
 
 sealed interface VaultState {
     data object NoVault : VaultState
-    data class Locked(val reason: String) : VaultState
-    data class Unlocked(val accounts: List<AccountInfo>, val level: HardwareKey.Level) : VaultState
+
+    /** `quick`: fingerprint unlock can be offered now; `quickNote` explains why not. */
+    data class Locked(val reason: String, val quick: Boolean, val quickNote: String?) : VaultState
+
+    data class Unlocked(
+        val accounts: List<AccountInfo>,
+        val level: HardwareKey.Level,
+        val quickEnabled: Boolean,
+    ) : VaultState
 }
 
 /**
@@ -51,7 +62,10 @@ class VaultController(context: Context) {
     private val app = context.applicationContext
     private val file = File(app.noBackupFilesDir, "vault.bin")
     private val atomic = AtomicFile(file)
+    private val quickFile = AtomicFile(File(app.noBackupFilesDir, "quick.bin"))
+    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val clipboard = app.getSystemService(ClipboardManager::class.java)
+    private val biometrics = app.getSystemService(BiometricManager::class.java)
     private val main = Handler(Looper.getMainLooper())
     private val mutex = Mutex()
 
@@ -79,8 +93,11 @@ class VaultController(context: Context) {
     private val _state = MutableStateFlow<VaultState>(lockedState(LOCKED))
     val state: StateFlow<VaultState> = _state
 
-    private fun lockedState(reason: String) =
-        if (vaultExists()) VaultState.Locked(reason) else VaultState.NoVault
+    private fun lockedState(reason: String): VaultState {
+        if (!vaultExists()) return VaultState.NoVault
+        val note = quickBlockedReason()
+        return VaultState.Locked(reason, quick = quickExists() && note == null, quickNote = if (quickExists()) note else null)
+    }
 
     // ---- Locking ---------------------------------------------------------------
 
@@ -120,8 +137,9 @@ class VaultController(context: Context) {
     suspend fun create(password: CharArray, auth: Authenticator) = mutex.withLock {
         if (vaultExists() || session != null) throw OtpException("이미 보관함이 있습니다.")
         if (password.size < MIN_PASSWORD) throw OtpException("비밀번호는 ${MIN_PASSWORD}자 이상이어야 합니다.")
+        removeQuick() // A leftover from an earlier vault can never apply to a new one.
         val keyId = VaultFile.randomBytes(16)
-        val key = withContext(Dispatchers.IO) { HardwareKey.create(keyId) }
+        val key = withContext(Dispatchers.IO) { HardwareKey.createVaultKey(keyId) }
         var written = false
         val s = VaultFile.randomBytes(32)
         var passwordKey: ByteArray? = null
@@ -130,7 +148,7 @@ class VaultController(context: Context) {
             val level = HardwareKey.level(key) ?: throw OtpException("하드웨어 보안 키가 아닙니다.")
             val salt = VaultFile.randomBytes(32)
             val draft = VaultHeader(VaultFile.ITERATIONS, salt, keyId, ByteArray(12), ByteArray(48))
-            val cipher = auth(HardwareKey.encryptCipher(key), "보관함 만들기")
+            val cipher = auth(HardwareKey.encryptCipher(key), "보관함 만들기", false)
             val wrapped = keystoreOp { cipher.updateAAD(draft.wrapAad()); cipher.doFinal(s) }
             val iv = cipher.iv
             if (wrapped.size != 48 || iv == null || iv.size != 12) throw OtpException("보안 키 출력 형식이 올바르지 않습니다.")
@@ -147,6 +165,7 @@ class VaultController(context: Context) {
             session = Session(header, pk, k, blob, mutableListOf(), level)
             passwordKey = null
             combined = null
+            markPasswordUsed()
             touch()
             publish()
         } finally {
@@ -154,7 +173,7 @@ class VaultController(context: Context) {
             passwordKey?.fill(0)
             combined?.fill(0)
             // Never leave a key behind for a vault that was not written.
-            if (!written) runCatching { HardwareKey.delete(keyId) }
+            if (!written) runCatching { HardwareKey.delete(HardwareKey.vaultAlias(keyId)) }
         }
     }
 
@@ -162,15 +181,58 @@ class VaultController(context: Context) {
         if (session != null) return@withLock
         val blob = withContext(Dispatchers.IO) { readVault() }
         val header = VaultFile.readHeader(blob)
-        val key = HardwareKey.get(header.keyId) ?: throw OtpException(
+        val key = HardwareKey.get(HardwareKey.vaultAlias(header.keyId)) ?: throw OtpException(
             "이 보관함의 보안 키가 이 기기에 없습니다. 보관함은 영구히 열 수 없습니다."
         )
         val level = HardwareKey.level(key) ?: throw OtpException("하드웨어 보안 키가 아닙니다.")
-        val cipher = auth(HardwareKey.decryptCipher(key, header.wrapIv), "잠금 해제")
+        val cipher = try {
+            auth(HardwareKey.decryptCipher(key, header.wrapIv), "잠금 해제", false)
+        } catch (e: KeyInvalidated) {
+            throw OtpException("기기의 화면 잠금이 해제되었거나 보안 키가 무효화되어 이 보관함은 영구히 열 수 없습니다.")
+        }
         val s = keystoreOp { cipher.updateAAD(header.wrapAad()); cipher.doFinal(header.wrapped) }
         val pk = withContext(Dispatchers.Default) { VaultFile.derivePassword(password, header.salt, header.iterations) }
         val k = VaultFile.combine(pk, s)
         s.fill(0)
+        open(blob, header, pk, k, level)
+        markPasswordUsed()
+    }
+
+    /** Fingerprint-only unlock with the session keys sealed by the quick key. */
+    suspend fun quickUnlock(auth: Authenticator) = mutex.withLock {
+        if (session != null) return@withLock
+        quickBlockedReason()?.let { throw OtpException(it) }
+        val blob = withContext(Dispatchers.IO) { readVault() }
+        val header = VaultFile.readHeader(blob)
+        val vaultKey = HardwareKey.get(HardwareKey.vaultAlias(header.keyId))
+            ?: throw OtpException("이 보관함의 보안 키가 이 기기에 없습니다.")
+        val level = HardwareKey.level(vaultKey) ?: throw OtpException("하드웨어 보안 키가 아닙니다.")
+        val quick = withContext(Dispatchers.IO) { readQuick() } ?: throw OtpException("지문 잠금 해제가 꺼져 있습니다.")
+        val quickKey = HardwareKey.get(HardwareKey.quickAlias(quick.keyId))
+        if (quickKey == null) {
+            removeQuick()
+            publishLocked()
+            throw OtpException("지문 잠금 해제 키가 없어 꺼졌습니다. 비밀번호로 여세요.")
+        }
+        val cipher = try {
+            auth(HardwareKey.decryptCipher(quickKey, quick.iv), "지문으로 열기", true)
+        } catch (e: KeyInvalidated) {
+            removeQuick()
+            publishLocked()
+            throw OtpException("지문 정보가 바뀌어 지문 잠금 해제가 꺼졌습니다. 비밀번호로 여세요.")
+        }
+        val plain = keystoreOp { cipher.updateAAD(QuickBlob.aad(quick.keyId, header)); cipher.doFinal(quick.ciphertext) }
+        if (plain.size != QuickBlob.PLAINTEXT) {
+            plain.fill(0)
+            throw OtpException("지문 잠금 해제 정보가 손상되었습니다.")
+        }
+        val pk = plain.copyOfRange(0, 32)
+        val k = plain.copyOfRange(32, 64)
+        plain.fill(0)
+        open(blob, header, pk, k, level)
+    }
+
+    private suspend fun open(blob: ByteArray, header: VaultHeader, pk: ByteArray, k: ByteArray, level: HardwareKey.Level) {
         try {
             val accounts = withContext(Dispatchers.Default) {
                 val plain = VaultFile.open(blob, k)
@@ -188,6 +250,76 @@ class VaultController(context: Context) {
             k.fill(0)
             throw e
         }
+    }
+
+    // ---- Fingerprint quick unlock ----------------------------------------------
+
+    /** Strong (class 3) biometrics are enrolled and usable. */
+    fun biometricsReady(): Boolean =
+        biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+
+    /** Turn on fingerprint unlock; re-confirms the password first. */
+    suspend fun enableQuick(password: CharArray, auth: Authenticator) = mutex.withLock {
+        val s = session ?: throw OtpException("보관함이 잠겨 있습니다.")
+        val gen = generation
+        if (!biometricsReady()) throw OtpException("지문을 먼저 등록하세요. (설정 → 보안 → 생체 인식)")
+        checkPassword(s, gen, password)
+        removeQuick()
+        val keyId = VaultFile.randomBytes(16)
+        val key = withContext(Dispatchers.IO) { HardwareKey.createQuickKey(keyId) }
+        var written = false
+        try {
+            val cipher = auth(HardwareKey.encryptCipher(key), "지문 잠금 해제 켜기", true)
+            if (gen != generation || session !== s) throw OtpException("보관함이 잠겨 변경하지 않았습니다.")
+            val plain = s.passwordKey + s.key
+            val ct = try {
+                keystoreOp { cipher.updateAAD(QuickBlob.aad(keyId, s.header)); cipher.doFinal(plain) }
+            } finally {
+                plain.fill(0)
+            }
+            val iv = cipher.iv
+            if (iv == null || iv.size != 12 || ct.size != QuickBlob.SIZE - 36) {
+                throw OtpException("보안 키 출력 형식이 올바르지 않습니다.")
+            }
+            withContext(Dispatchers.IO) { writeAtomic(quickFile, QuickBlob(keyId, iv, ct).encode()) }
+            written = true
+            markPasswordUsed()
+            publish()
+        } finally {
+            if (!written) runCatching { HardwareKey.delete(HardwareKey.quickAlias(keyId)) }
+        }
+    }
+
+    fun disableQuick() {
+        removeQuick()
+        if (session != null) publish() else publishLocked()
+    }
+
+    private fun quickExists() = quickFile.baseFile.exists()
+
+    /** Why fingerprint unlock can't be used now, or null if it can. */
+    private fun quickBlockedReason(): String? {
+        if (!quickExists()) return "지문 잠금 해제가 꺼져 있습니다."
+        if (!biometricsReady()) return "지문을 사용할 수 없습니다. 비밀번호로 여세요."
+        val last = prefs.getLong(PREF_PASSWORD_AT, 0L)
+        val now = System.currentTimeMillis()
+        // Also when the clock was moved back: the password is needed again.
+        if (last <= 0L || now < last || now - last > PASSWORD_EVERY_MS) {
+            return "비밀번호를 잊지 않도록 14일마다 한 번은 비밀번호로 열어야 합니다."
+        }
+        return null
+    }
+
+    private fun markPasswordUsed() {
+        prefs.edit().putLong(PREF_PASSWORD_AT, System.currentTimeMillis()).apply()
+    }
+
+    private fun readQuick(): QuickBlob? = if (quickExists()) QuickBlob.decode(quickFile.readFully()) else null
+
+    /** Delete the quick key and file; never touches the vault or its key. */
+    private fun removeQuick() {
+        runCatching { readQuick() }.getOrNull()?.let { runCatching { HardwareKey.delete(HardwareKey.quickAlias(it.keyId)) } }
+        quickFile.delete()
     }
 
     // ---- Changes ---------------------------------------------------------------
@@ -213,16 +345,20 @@ class VaultController(context: Context) {
         val s = session ?: throw OtpException("보관함이 잠겨 있습니다.")
         val gen = generation
         if (s.accounts.getOrNull(index)?.name != name) throw OtpException("선택한 계정이 바뀌었습니다. 다시 시도하세요.")
+        checkPassword(s, gen, password)
+        save(s, gen, s.accounts.filterIndexed { i, _ -> i != index })
+        s.accounts.removeAt(index).wipe()
+        publish()
+    }
+
+    private suspend fun checkPassword(s: Session, gen: Long, password: CharArray) {
         val typed = withContext(Dispatchers.Default) {
             VaultFile.derivePassword(password, s.header.salt, s.header.iterations)
         }
         val ok = VaultFile.sameKey(typed, s.passwordKey)
         typed.fill(0)
-        if (gen != generation) throw OtpException("보관함이 잠겼습니다.")
+        if (gen != generation || session !== s) throw OtpException("보관함이 잠겼습니다.")
         if (!ok) throw OtpException("비밀번호가 올바르지 않습니다.")
-        save(s, gen, s.accounts.filterIndexed { i, _ -> i != index })
-        s.accounts.removeAt(index).wipe()
-        publish()
     }
 
     private suspend fun save(s: Session, gen: Long, next: List<Account>) {
@@ -280,7 +416,13 @@ class VaultController(context: Context) {
         _state.value = VaultState.Unlocked(
             s.accounts.mapIndexed { i, a -> AccountInfo(i, a.name, a.algorithm, a.digits, a.period) },
             s.level,
+            quickExists(),
         )
+    }
+
+    private fun publishLocked() {
+        val reason = (_state.value as? VaultState.Locked)?.reason ?: LOCKED
+        _state.value = lockedState(reason)
     }
 
     private inline fun keystoreOp(op: () -> ByteArray): ByteArray = try {
@@ -300,36 +442,39 @@ class VaultController(context: Context) {
 
     private fun writeNew(blob: ByteArray) {
         if (vaultExists()) throw OtpException("기존 보관함이 있어 새로 만들 수 없습니다.")
-        write(blob)
+        writeAtomic(atomic, blob)
     }
 
     private fun writeReplace(expected: ByteArray, blob: ByteArray) {
         if (!readVault().contentEquals(expected)) {
             throw OtpException("보관함 파일이 다른 곳에서 변경되었습니다. 잠근 뒤 다시 여세요.")
         }
-        write(blob)
+        writeAtomic(atomic, blob)
     }
 
-    private fun write(blob: ByteArray) {
-        val out = atomic.startWrite()
+    private fun writeAtomic(target: AtomicFile, blob: ByteArray) {
+        val out = target.startWrite()
         try {
             out.write(blob)
-            atomic.finishWrite(out) // fsync, then atomic rename
+            target.finishWrite(out) // fsync, then atomic rename
         } catch (e: Exception) {
-            atomic.failWrite(out)
-            throw OtpException("보관함을 저장하지 못했습니다: ${e.message}")
+            target.failWrite(out)
+            throw OtpException("저장하지 못했습니다: ${e.message}")
         }
     }
 
     companion object {
         const val MIN_PASSWORD = 12
         const val LOCKED = "보관함이 잠겨 있습니다."
+        const val LOCKED_MANUAL = "잠갔습니다."
         const val LOCKED_IDLE = "5분 동안 사용하지 않아 잠겼습니다."
         const val LOCKED_BACKGROUND = "앱을 벗어나 잠겼습니다."
         const val LOCKED_SCREEN = "화면이 꺼져 잠겼습니다."
         private const val CLIP_LABEL = "Local OTP"
+        private const val PREF_PASSWORD_AT = "passwordUnlockedAt"
         private const val IDLE_MS = 5 * 60 * 1000L
         private const val BACKGROUND_MS = 30 * 1000L
         private const val CLIPBOARD_MS = 30 * 1000L
+        private const val PASSWORD_EVERY_MS = 14 * 24 * 60 * 60 * 1000L
     }
 }

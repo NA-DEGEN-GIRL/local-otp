@@ -1,6 +1,13 @@
-# Local OTP for Windows
+# Local OTP
 
-**TPM에 묶여 비밀키를 다시 꺼낼 수 없는, 오프라인 Windows TOTP 인증 앱**
+**하드웨어에 묶여 비밀키를 다시 꺼낼 수 없는, 오프라인 TOTP 인증 앱 — Windows · Android**
+
+| 앱 | 위치 | 보호 |
+| --- | --- | --- |
+| Windows | 이 문서 (저장소 최상위) | TPM + 비밀번호 |
+| Android | [`android/`](android/README.md) | Android Keystore(StrongBox/TEE) + 생체인증/화면 잠금 + 비밀번호 |
+
+아래는 **Windows 앱** 설명입니다.
 
 > 📱 **Android 버전**은 [`android/`](android/README.md)에 있습니다. 같은 설계(복원 불가능, 하드웨어 키 + 비밀번호, 네트워크 권한 없음)를 Android Keystore(StrongBox/TEE)와 생체인증으로 구현했습니다. 두 앱은 서로 데이터를 주고받지 않으며, 각 기기에서 원본 시크릿키로 따로 등록합니다.
 

@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "local-otp-android"
+rootProject.name = "local-otp"
 include(":app")

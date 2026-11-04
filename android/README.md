@@ -2,7 +2,7 @@
 
 **안드로이드 하드웨어 보안(StrongBox/TEE)에 묶여 비밀키를 다시 꺼낼 수 없는, 오프라인 TOTP 인증 앱**
 
-> An offline TOTP authenticator for Android 12+. Secrets are sealed with a non-exportable Android Keystore key (StrongBox when available) that needs biometric or screen-lock authentication on every use, plus your password (optional biometric-only unlock). They can never be displayed or exported. The app has no INTERNET permission. Companion of [local-otp-windows](https://github.com/NA-DEGEN-GIRL/local-otp-windows).
+> An offline TOTP authenticator for Android 12+. Secrets are sealed with a non-exportable Android Keystore key (StrongBox when available) that needs biometric or screen-lock authentication on every use, plus your password (optional biometric-only unlock). They can never be displayed or exported. The app has no INTERNET permission. Companion of the [Windows app](../README.md) in the same repository.
 
 ## 한눈에 보기
 
@@ -105,4 +105,4 @@ K = PBKDF2-HMAC-SHA256(비밀번호, 600,000회) XOR S
 
 ## 라이선스
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](../LICENSE)

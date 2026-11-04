@@ -2,6 +2,8 @@
 
 **TPM에 묶여 비밀키를 다시 꺼낼 수 없는, 오프라인 Windows TOTP 인증 앱**
 
+> 📱 **Android 버전**은 [`android/`](android/README.md)에 있습니다. 같은 설계(복원 불가능, 하드웨어 키 + 비밀번호, 네트워크 권한 없음)를 Android Keystore(StrongBox/TEE)와 생체인증으로 구현했습니다. 두 앱은 서로 데이터를 주고받지 않으며, 각 기기에서 원본 시크릿키로 따로 등록합니다.
+
 > An offline TOTP authenticator for Windows 11. Secrets are sealed with a non-exportable TPM key plus your password, and can never be displayed or exported again — not even by this app. Keep your original secrets somewhere else; this app only generates codes. Rust, zero third-party crates, Windows CNG only.
 
 <p align="center">

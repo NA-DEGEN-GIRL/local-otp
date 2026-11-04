@@ -95,6 +95,10 @@ class VaultFormatTest {
             "1a5272cfa750c2558cad9c3518ddc22ae5d93316d6bd497af0be7016a1e52cb3",
             key.joinToString("") { "%02x".format(it) },
         )
+        // Decomposed Hangul (jamo) from another keyboard gives the same key.
+        val decomposed = java.text.Normalizer.normalize("한글 password 123", java.text.Normalizer.Form.NFD)
+        assertNotEquals("한글 password 123", decomposed)
+        assertArrayEquals(key, VaultFile.derivePassword(decomposed.toCharArray(), salt, 100_000))
         val other = VaultFile.derivePassword("한글 password 124".toCharArray(), salt, 100_000)
         assertFalse(VaultFile.sameKey(key, other))
         assertTrue(VaultFile.sameKey(key, key.copyOf()))

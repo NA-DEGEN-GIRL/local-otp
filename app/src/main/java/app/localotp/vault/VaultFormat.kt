@@ -156,13 +156,24 @@ object VaultFile {
     }
 
     /**
-     * PBKDF2-HMAC-SHA256 over the UTF-8 bytes of the password. The bytes are
-     * hex-encoded into ASCII chars for PBEKeySpec, so the result never depends
-     * on how a crypto provider encodes non-ASCII characters (a provider change
-     * must not make a Korean password stop working).
+     * PBKDF2-HMAC-SHA256 whose password input is the lowercase hex of the
+     * UTF-8 bytes of the NFC-normalized password, passed as ASCII chars.
+     * - NFC: a keyboard that emits decomposed Hangul (jamo) must give the same key.
+     * - Hex: the result never depends on how a crypto provider encodes
+     *   non-ASCII characters (a provider change must not lock anyone out).
      */
     fun derivePassword(password: CharArray, salt: ByteArray, iterations: Int): ByteArray {
-        val utf8 = Charsets.UTF_8.newEncoder().encode(java.nio.CharBuffer.wrap(password))
+        val input = java.nio.CharBuffer.wrap(password)
+        val normalized = if (java.text.Normalizer.isNormalized(input, java.text.Normalizer.Form.NFC)) {
+            input
+        } else {
+            java.nio.CharBuffer.wrap(java.text.Normalizer.normalize(input, java.text.Normalizer.Form.NFC))
+        }
+        val utf8 = try {
+            Charsets.UTF_8.newEncoder().encode(normalized)
+        } catch (e: java.nio.charset.CharacterCodingException) {
+            throw OtpException("비밀번호에 사용할 수 없는 문자가 있습니다.")
+        }
         val bytes = ByteArray(utf8.remaining()).also { utf8.get(it) }
         if (utf8.hasArray()) utf8.array().fill(0)
         val hexChars = CharArray(bytes.size * 2)
@@ -175,7 +186,10 @@ object VaultFile {
         val spec = PBEKeySpec(hexChars, salt, iterations, 256)
         hexChars.fill('\u0000')
         try {
-            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+            val secret = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec)
+            val encoded = secret.encoded
+            runCatching { secret.destroy() } // Best effort; many providers don't support it.
+            return encoded
         } finally {
             spec.clearPassword()
         }
@@ -243,7 +257,7 @@ class QuickBlob(val keyId: ByteArray, val iv: ByteArray, val ciphertext: ByteArr
 
         fun decode(bytes: ByteArray): QuickBlob {
             if (bytes.size != SIZE || !bytes.copyOfRange(0, 8).contentEquals(MAGIC)) {
-                throw OtpException("지문 잠금 해제 정보가 손상되었습니다.")
+                throw OtpException("생체인증 잠금 해제 정보가 손상되었습니다.")
             }
             return QuickBlob(bytes.copyOfRange(8, 24), bytes.copyOfRange(24, 36), bytes.copyOfRange(36, SIZE))
         }

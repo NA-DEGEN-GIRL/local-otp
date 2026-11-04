@@ -1,6 +1,7 @@
 package app.localotp
 
 import android.app.Application
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -10,8 +11,10 @@ import android.hardware.biometrics.BiometricPrompt
 import android.os.Build
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.os.PowerManager
 import android.view.View
 import android.view.WindowManager
+import android.view.autofill.AutofillManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -54,11 +57,15 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
         // Hide other apps' overlay windows over ours (tapjacking, fake prompts).
         window.setHideOverlayWindows(true)
-        // Only real assistive tools (e.g. TalkBack) may read the screen;
-        // other accessibility services, a common spyware route, see nothing.
+        // Android 14+: services that are not declared assistive tools are
+        // denied this window's content; sensitive Compose nodes are also
+        // marked individually (see ui/Sensitive.kt).
         if (Build.VERSION.SDK_INT >= 34) {
             window.decorView.setAccessibilityDataSensitive(View.ACCESSIBILITY_DATA_SENSITIVE_YES)
         }
+        // Never offer to save the vault password or a TOTP secret to an
+        // autofill service (often a cloud password manager).
+        window.decorView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         enableEdgeToEdge()
         setContent {
             LocalOtpTheme {
@@ -74,9 +81,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        // A biometric prompt or the camera permission dialog also stops us
-        // briefly; the 30-second grace period covers that and app switching.
-        vault.onBackground()
+        getSystemService(AutofillManager::class.java)?.cancel()
+        // Screen off or keyguard shown: lock now, without relying on a timer
+        // or a broadcast that a frozen process would receive late. Otherwise
+        // (app switch, a prompt) the 30-second grace period applies.
+        val power = getSystemService(PowerManager::class.java)
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        if (!power.isInteractive || keyguard.isKeyguardLocked) {
+            vault.lock(VaultController.LOCKED_SCREEN)
+        } else {
+            vault.onBackground()
+        }
     }
 
     override fun onUserInteraction() {
@@ -94,7 +109,7 @@ class MainActivity : ComponentActivity() {
                 .setTitle(title)
                 .setConfirmationRequired(false)
             if (biometricOnly) {
-                builder.setSubtitle("등록된 지문으로 확인하세요")
+                builder.setSubtitle("등록된 생체 정보로 확인하세요")
                     .setAllowedAuthenticators(Authenticators.BIOMETRIC_STRONG)
                     .setNegativeButton("비밀번호 사용", mainExecutor) { _, _ ->
                         if (cont.isActive) cont.resumeWithException(AuthCancelled())
@@ -123,9 +138,11 @@ class MainActivity : ComponentActivity() {
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                         if (!cont.isActive) return
+                        // 13 = negative button ("비밀번호 사용"); timeout is also not an error.
                         val cancelled = errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED ||
                             errorCode == BiometricPrompt.BIOMETRIC_ERROR_CANCELED ||
-                            errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED
+                            errorCode == BiometricPrompt.BIOMETRIC_ERROR_TIMEOUT ||
+                            errorCode == 13
                         cont.resumeWithException(
                             if (cancelled) AuthCancelled() else OtpException("인증 실패: $errString")
                         )

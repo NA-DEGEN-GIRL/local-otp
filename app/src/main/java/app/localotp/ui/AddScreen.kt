@@ -15,7 +15,6 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.clearText
-import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -50,6 +49,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,8 +82,8 @@ fun AddScreen(
 ) {
     val scope = rememberCoroutineScope()
     val first = draft?.accounts?.firstOrNull()
-    val name = rememberTextFieldState(first?.name ?: "")
-    val secretField = rememberTextFieldState()
+    val name = rememberUnsavedTextFieldState(first?.name ?: "")
+    val secretField = rememberUnsavedTextFieldState()
     var algorithm by remember { mutableStateOf(first?.algorithm ?: Algorithm.SHA1) }
     var digits by remember { mutableStateOf(first?.digits ?: 6) }
     var period by remember { mutableStateOf(first?.period ?: 30) }
@@ -101,6 +101,7 @@ fun AddScreen(
             try {
                 val accounts = Links.parse(text)
                 secretField.clearText()
+                vault.clearClipboardIfHolds(text) // The link carries the secret.
                 if (accounts.size > 1) {
                     onImport(Draft(accounts))
                 } else {
@@ -246,6 +247,7 @@ fun AddScreen(
                             )
                             Text(
                                 code,
+                                modifier = Modifier.sensitive(),
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 34.sp,
@@ -347,7 +349,7 @@ fun ImportScreen(vault: VaultController, draft: Draft, existingNames: List<Strin
                 )
             }
             itemsIndexed(draft.accounts) { i, a ->
-                Card(Modifier.fillMaxWidth()) {
+                Card(Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}.sensitive()) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = selected[i], onCheckedChange = { selected[i] = it }, enabled = !busy)
                         Column(Modifier.weight(1f)) {

@@ -78,14 +78,20 @@ object HardwareKey {
             try {
                 generator.init(spec(true))
                 generator.generateKey()
-            } catch (e: StrongBoxUnavailableException) {
+            } catch (e: Exception) {
+                // No StrongBox, or (on some devices) a ProviderException for an
+                // unsupported parameter combination: use the TEE instead.
+                if (e !is StrongBoxUnavailableException && e !is java.security.ProviderException) throw e
+                runCatching { store().deleteEntry(alias) }
                 generator.init(spec(false))
                 generator.generateKey()
             }
-        } catch (e: java.security.GeneralSecurityException) {
-            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금과 지문이 설정되어 있는지 확인하세요. (${e.javaClass.simpleName})")
+        } catch (e: OtpException) {
+            throw e
+        } catch (e: Exception) {
+            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금(과 생체인증)이 설정되어 있는지 확인하세요. (${e.javaClass.simpleName})")
         } catch (e: IllegalStateException) {
-            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금과 지문이 설정되어 있는지 확인하세요.")
+            throw OtpException("보안 키를 만들 수 없습니다. 화면 잠금(과 생체인증)이 설정되어 있는지 확인하세요.")
         }
         if (level(key) == null) {
             delete(alias)
@@ -107,6 +113,12 @@ object HardwareKey {
     /** Only for an unfinished vault creation, or the quick key when turned off. */
     fun delete(alias: String) {
         store().deleteEntry(alias)
+    }
+
+    /** Delete every quick-unlock key (separate prefix; vault keys are never touched). */
+    fun deleteAllQuick() {
+        val ks = store()
+        ks.aliases().toList().filter { it.startsWith(QUICK) }.forEach { runCatching { ks.deleteEntry(it) } }
     }
 
     // Initialized only: AAD and data are passed after the user authenticates the

@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.input.TextFieldLineLimits
-import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Lock
@@ -67,7 +66,7 @@ import kotlinx.coroutines.launch
 fun AccountsScreen(vault: VaultController, auth: Authenticator, state: VaultState.Unlocked, now: Long, onAdd: () -> Unit) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
-    val search = rememberTextFieldState()
+    val search = rememberUnsavedTextFieldState()
     var deleting by remember { mutableStateOf<AccountInfo?>(null) }
     var menu by remember { mutableStateOf(false) }
     var quickDialog by remember { mutableStateOf(false) }
@@ -94,7 +93,7 @@ fun AccountsScreen(vault: VaultController, auth: Authenticator, state: VaultStat
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(
-                            text = { Text(if (state.quickEnabled) "지문 잠금 해제 끄기" else "지문 잠금 해제 켜기") },
+                            text = { Text(if (state.quickEnabled) "생체인증 잠금 해제 끄기" else "생체인증 잠금 해제 켜기") },
                             onClick = {
                                 menu = false
                                 quickDialog = true
@@ -156,7 +155,7 @@ fun AccountsScreen(vault: VaultController, auth: Authenticator, state: VaultStat
                             if (vault.copy(account.index, System.currentTimeMillis() / 1000)) {
                                 scope.launch {
                                     snackbar.currentSnackbarData?.dismiss()
-                                    snackbar.showSnackbar("‘${account.name}’ 코드를 복사했습니다 · 30초 후 지워집니다")
+                                    snackbar.showSnackbar("코드를 복사했습니다 · 30초 후 지워집니다")
                                 }
                             }
                         },
@@ -177,7 +176,7 @@ fun AccountsScreen(vault: VaultController, auth: Authenticator, state: VaultStat
     deleting?.let { account ->
         DeleteDialog(vault, account, onClose = { deleting = null }, onDeleted = {
             deleting = null
-            scope.launch { snackbar.showSnackbar("‘${account.name}’ 계정을 삭제했습니다.") }
+            scope.launch { snackbar.showSnackbar("계정을 삭제했습니다.") }
         })
     }
 }
@@ -191,15 +190,19 @@ private fun QuickUnlockDialog(
     onChanged: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    val pass = rememberTextFieldState()
+    val pass = rememberUnsavedTextFieldState()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
     fun submit() {
         if (busy) return
         if (enabled) {
-            vault.disableQuick()
-            onChanged("지문 잠금 해제를 껐습니다.")
+            busy = true
+            scope.launch {
+                runVaultAction({ error = it }) { vault.disableQuick() }
+                busy = false
+                onChanged("생체인증 잠금 해제를 껐습니다.")
+            }
             return
         }
         val p = pass.chars()
@@ -216,23 +219,23 @@ private fun QuickUnlockDialog(
             }
             p.fill('\u0000')
             busy = false
-            if (ok) onChanged("지문 잠금 해제를 켰습니다.")
+            if (ok) onChanged("생체인증 잠금 해제를 켰습니다.")
         }
     }
 
     AlertDialog(
         onDismissRequest = { if (!busy) onClose() },
-        title = { Text(if (enabled) "지문 잠금 해제 끄기" else "지문 잠금 해제 켜기") },
+        title = { Text(if (enabled) "생체인증 잠금 해제 끄기" else "생체인증 잠금 해제 켜기") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 if (enabled) {
                     Text("다음부터는 비밀번호와 화면 잠금 인증으로 엽니다.")
                 } else {
                     Text(
-                        "등록된 지문만으로 보관함을 엽니다(얼굴·PIN은 사용하지 않음).\n" +
-                            "• 지문을 새로 등록하면 자동으로 꺼집니다.\n" +
-                            "• 비밀번호를 잊지 않도록 14일마다 한 번은 비밀번호가 필요합니다.\n" +
-                            "• 지문을 강제로 대게 할 수 있는 상황이 걱정되면 켜지 마세요.",
+                        "비밀번호 없이 강한 생체인증만으로 보관함을 엽니다. 대부분 지문이며, 일부 기기에서는 보안 등급이 높은 얼굴 인식도 포함됩니다. 화면 잠금 PIN·패턴으로는 열 수 없습니다.\n" +
+                            "• 생체 정보를 새로 등록하면 자동으로 꺼집니다.\n" +
+                            "• 비밀번호를 잊지 않도록 14일마다 한 번은 비밀번호가 필요합니다(알림용이며 보안 한계는 아님).\n" +
+                            "• 잠든 사이나 강요로 생체인증을 당할 수 있는 상황이 걱정되면 켜지 마세요.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     OutlinedSecureTextField(
@@ -269,6 +272,7 @@ private fun AccountCard(
     ElevatedCard(
         Modifier
             .fillMaxWidth()
+            .sensitive()
             .combinedClickable(
                 onClickLabel = "코드 복사",
                 onLongClickLabel = "삭제",
@@ -329,7 +333,7 @@ private fun DeleteDialog(
     onDeleted: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    val pass = rememberTextFieldState()
+    val pass = rememberUnsavedTextFieldState()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -361,6 +365,7 @@ private fun DeleteDialog(
                 Text(
                     "‘${account.name}’ 계정을 영구 삭제합니다. 원본 시크릿키가 없으면 다시 등록할 수 없습니다.",
                     color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.sensitive(),
                 )
                 OutlinedSecureTextField(
                     state = pass,

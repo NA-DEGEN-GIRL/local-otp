@@ -117,7 +117,13 @@ fun ScanScreen(onResult: (List<ParsedAccount>) -> Unit, onCancel: () -> Unit) {
         }
     }
     val executor = remember { Executors.newSingleThreadExecutor() }
-    DisposableEffect(Unit) { onDispose { executor.shutdown() } }
+    val disposed = remember { AtomicBoolean(false) }
+    DisposableEffect(Unit) {
+        onDispose {
+            disposed.set(true)
+            executor.shutdown()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -137,6 +143,8 @@ fun ScanScreen(onResult: (List<ParsedAccount>) -> Unit, onCancel: () -> Unit) {
                         val view = PreviewView(ctx)
                         val future = ProcessCameraProvider.getInstance(ctx)
                         future.addListener({
+                            // The screen may have closed (e.g. the vault locked) meanwhile.
+                            if (disposed.get()) return@addListener
                             val provider = future.get()
                             val preview = Preview.Builder().build().also { it.setSurfaceProvider(view.surfaceProvider) }
                             val analysis = ImageAnalysis.Builder()

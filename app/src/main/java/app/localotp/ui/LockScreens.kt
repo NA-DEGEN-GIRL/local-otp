@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.clearText
-import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
@@ -46,6 +45,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.localotp.vault.VaultController
 import app.localotp.vault.VaultState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -56,18 +56,23 @@ internal suspend fun runVaultAction(setError: (String?) -> Unit, action: suspend
     setError(null)
     try {
         action()
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: AuthCancelled) {
-        // The user closed the prompt.
+        // The user closed the prompt, or a lock interrupted the action.
     } catch (e: OtpException) {
         setError(e.message)
+    } catch (e: Exception) {
+        // Never crash, and never show details of unexpected (crypto) errors.
+        setError("처리하지 못했습니다. (${e.javaClass.simpleName})")
     }
 }
 
 @Composable
 fun SetupScreen(vault: VaultController, auth: Authenticator) {
     val scope = rememberCoroutineScope()
-    val pass = rememberTextFieldState()
-    val confirm = rememberTextFieldState()
+    val pass = rememberUnsavedTextFieldState()
+    val confirm = rememberUnsavedTextFieldState()
     var understood by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -159,7 +164,7 @@ fun SetupScreen(vault: VaultController, auth: Authenticator) {
 @Composable
 fun UnlockScreen(vault: VaultController, auth: Authenticator, state: VaultState.Locked) {
     val scope = rememberCoroutineScope()
-    val pass = rememberTextFieldState()
+    val pass = rememberUnsavedTextFieldState()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -227,7 +232,7 @@ fun UnlockScreen(vault: VaultController, auth: Authenticator, state: VaultState.
             }
             if (state.quick) {
                 FilledTonalButton(onClick = { quick() }, enabled = !busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                    Text("지문으로 열기")
+                    Text("생체인증으로 열기")
                 }
             } else {
                 state.quickNote?.let {

@@ -802,14 +802,39 @@ fn validate_blob(blob: &[u8]) -> Result<(usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Opt-in only: this test creates (or reuses) a persistent key named
-    // OtpMigration.WindowsOtp.SyntheticTestKey.<random> under the current Windows
-    // account and does not delete it. Ordinary cargo test must never create,
-    // alter, or delete TPM keys. Never remove an existing key unless its
-    // ownership has been established.
+    #[link(name = "ncrypt")]
+    unsafe extern "system" {
+        fn NCryptDeleteKey(key: Handle, flags: u32) -> SecurityStatus;
+    }
+
+    /// Deletes the synthetic key created by this test process, even if the test
+    /// panics. The name has a random per-process suffix, so it can only refer to
+    /// a key this run created; the app's real key name is not compiled into tests.
+    struct DeleteSyntheticKey;
+    impl Drop for DeleteSyntheticKey {
+        fn drop(&mut self) {
+            assert!(test_key_name().starts_with("OtpMigration.WindowsOtp.SyntheticTestKey."));
+            if let Ok(key) = tpm_key(false) {
+                // NCryptDeleteKey also frees the handle.
+                let status = unsafe { NCryptDeleteKey(key.0, 0) };
+                std::mem::forget(key);
+                assert_eq!(status, 0, "could not delete synthetic TPM test key");
+            }
+            assert!(
+                tpm_key(false).is_err(),
+                "synthetic TPM test key still exists"
+            );
+        }
+    }
+
+    // Opt-in only (`cargo test -- --ignored`): uses the real TPM with a key named
+    // OtpMigration.WindowsOtp.SyntheticTestKey.<random> and deletes it afterwards.
+    // Ordinary cargo test must never create, alter, or delete TPM keys.
     #[test]
-    #[ignore = "creates a randomly named persistent synthetic TPM test key"]
+    #[ignore = "uses the hardware TPM with a temporary synthetic key"]
     fn synthetic_roundtrip_and_tamper() {
+        let _cleanup = DeleteSyntheticKey;
+        assert!(tpm_key(false).is_err(), "synthetic key name already in use");
         let message = b"synthetic vault test, no real secrets";
         let (blob, key) = create("synthetic-password", message).expect("TPM encrypt");
         let (plain, opened) = open("synthetic-password", &blob).unwrap();
@@ -835,6 +860,26 @@ mod tests {
         let mut wrong_key = blob.clone();
         wrong_key[52] ^= 1;
         assert!(reencrypt(&key, b"updated", &wrong_key).is_err());
+
+        // The TPM must refuse to export the private key in any form.
+        let tpm = tpm_key(false).unwrap();
+        for blob_type in ["RSAPRIVATEBLOB", "RSAFULLPRIVATEBLOB", "PKCS8_PRIVATEKEY"] {
+            let typ = wide(blob_type);
+            let mut len = 0;
+            let status = unsafe {
+                NCryptExportKey(
+                    tpm.0,
+                    ptr::null_mut(),
+                    typ.as_ptr(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                    &mut len,
+                    0,
+                )
+            };
+            assert_ne!(status, 0, "TPM allowed {blob_type} export");
+        }
     }
 
     #[test]

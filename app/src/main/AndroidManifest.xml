@@ -5,6 +5,8 @@
     <!-- Deliberately no INTERNET permission: the app cannot use the network.
          The camera is only used to read QR codes, decoded on the device. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- BiometricPrompt (fingerprint/face or screen lock) for the Keystore key. -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <!-- Lets the app hide other apps' overlays drawn over its window. -->
     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />

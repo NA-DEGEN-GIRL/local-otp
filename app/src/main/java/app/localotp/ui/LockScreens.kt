@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.clearText
 import androidx.compose.foundation.verticalScroll
@@ -36,6 +37,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.localotp.otp.OtpException
@@ -64,6 +66,8 @@ internal suspend fun runVaultAction(setError: (String?) -> Unit, action: suspend
         setError(e.message)
     } catch (e: Exception) {
         // Never crash, and never show details of unexpected (crypto) errors.
+        // The log has the type and stack only (no secrets) for diagnosis.
+        android.util.Log.w("LocalOtp", "Unexpected error", e)
         setError("처리하지 못했습니다. (${e.javaClass.simpleName})")
     }
 }
@@ -131,18 +135,26 @@ fun SetupScreen(vault: VaultController, auth: Authenticator) {
             OutlinedSecureTextField(
                 state = pass,
                 label = { Text("새 비밀번호 (${VaultController.MIN_PASSWORD}자 이상)") },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().secretField("새 비밀번호 (${VaultController.MIN_PASSWORD}자 이상)"),
                 enabled = !busy,
             )
             OutlinedSecureTextField(
                 state = confirm,
                 label = { Text("비밀번호 확인") },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().secretField("비밀번호 확인"),
                 enabled = !busy,
                 onKeyboardAction = { submit() },
             )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = understood, onCheckedChange = { understood = it }, enabled = !busy)
+            Row(
+                Modifier.fillMaxWidth().toggleable(
+                    value = understood,
+                    enabled = !busy,
+                    role = Role.Checkbox,
+                    onValueChange = { understood = it },
+                ),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(checked = understood, onCheckedChange = null, enabled = !busy)
                 Text(
                     "복구할 수 없으며 원본 시크릿키를 따로 보관해야 한다는 점을 이해했습니다.",
                     style = MaterialTheme.typography.bodyMedium,
@@ -222,7 +234,7 @@ fun UnlockScreen(vault: VaultController, auth: Authenticator, state: VaultState.
             OutlinedSecureTextField(
                 state = pass,
                 label = { Text("비밀번호") },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().secretField("비밀번호"),
                 enabled = !busy,
                 onKeyboardAction = { submit() },
             )

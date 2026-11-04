@@ -39,7 +39,13 @@ class LocalOtpApp : Application() {
         registerReceiver(
             object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    vault.lock(VaultController.LOCKED_SCREEN)
+                    // A frozen process gets this broadcast late, possibly after
+                    // the screen is back on and the user is unlocking again;
+                    // then it is stale (onStop already locked) and must not
+                    // cancel the unlock in progress.
+                    if (!getSystemService(PowerManager::class.java).isInteractive) {
+                        vault.lock(VaultController.LOCKED_SCREEN)
+                    }
                 }
             },
             IntentFilter(Intent.ACTION_SCREEN_OFF),
@@ -128,6 +134,7 @@ class MainActivity : ComponentActivity() {
                 object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                         val authorized = result.cryptoObject?.cipher
+                        android.util.Log.i("LocalOtp", "prompt ok (active=${cont.isActive})")
                         if (!cont.isActive) return
                         if (authorized == null) {
                             cont.resumeWithException(OtpException("인증 결과에 보안 키 작업이 없습니다."))
@@ -137,6 +144,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        android.util.Log.i("LocalOtp", "prompt error $errorCode")
                         if (!cont.isActive) return
                         // 13 = negative button ("비밀번호 사용"); timeout is also not an error.
                         val cancelled = errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED ||

@@ -224,7 +224,7 @@ fun AddScreen(
                 OutlinedSecureTextField(
                     state = secretField,
                     label = { Text("비밀키 (Base32 또는 otpauth:// 링크)") },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().secretField("비밀키 (Base32 또는 otpauth:// 링크)"),
                     enabled = !busy,
                 )
             }

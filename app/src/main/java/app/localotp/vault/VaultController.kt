@@ -142,6 +142,7 @@ class VaultController(context: Context) {
 
     /** Wipe all key material and secrets immediately. */
     fun lock(reason: String) {
+        android.util.Log.i(TAG, "lock: $reason (open=${session != null})")
         generation++
         main.removeCallbacks(backgroundLock)
         session?.wipe()
@@ -152,12 +153,16 @@ class VaultController(context: Context) {
 
     /** Abort silently if a lock happened while the action was suspended. */
     private fun checkNotLocked(gen: Long) {
-        if (gen != generation) throw AuthCancelled()
+        if (gen != generation) {
+            android.util.Log.i(TAG, "action cancelled: locked meanwhile")
+            throw AuthCancelled()
+        }
     }
 
     /** Open the session, unless a lock happened meanwhile (then wipe the keys). */
     private fun startSession(gen: Long, s: Session) {
         if (gen != generation) {
+            android.util.Log.i(TAG, "unlock discarded: locked meanwhile")
             s.wipe()
             throw AuthCancelled()
         }
@@ -537,6 +542,7 @@ class VaultController(context: Context) {
     }
 
     companion object {
+        private const val TAG = "LocalOtp"
         const val MIN_PASSWORD = 12
         const val LOCKED = "보관함이 잠겨 있습니다."
         const val LOCKED_MANUAL = "잠갔습니다."

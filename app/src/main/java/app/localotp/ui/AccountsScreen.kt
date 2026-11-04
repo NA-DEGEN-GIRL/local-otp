@@ -240,7 +240,8 @@ private fun QuickUnlockDialog(
                     )
                     OutlinedSecureTextField(
                         state = pass,
-                        label = { Text("보관함 비밀번호") },
+                        modifier = Modifier.secretField("보관함 비밀번호"),
+                    label = { Text("보관함 비밀번호") },
                         enabled = !busy,
                         onKeyboardAction = { submit() },
                     )
@@ -369,6 +370,7 @@ private fun DeleteDialog(
                 )
                 OutlinedSecureTextField(
                     state = pass,
+                    modifier = Modifier.secretField("보관함 비밀번호"),
                     label = { Text("보관함 비밀번호") },
                     enabled = !busy,
                     onKeyboardAction = { submit() },
